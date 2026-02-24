@@ -1,14 +1,25 @@
+[日本語版README](README_ja.md)
 # SigAnalyzer
-IDAのFLIRTシグネチャをGhidraに適応するPlugin
+A Ghidra plugin that applies IDA's FLIRT signatures to Ghidra.
 
-AnalyzerにSigAnalyzerが追加される。
+SigAnalyzer is added to the Analyzer.
 
-Toolsに追加されるメニューでsigの追加・削除、Analyzerから除外するファイルの選択ができる。
+A menu is added under **Tools** where you can add/remove signatures and choose which files to exclude from the Analyzer.
 
-## 追加したFLIRTシグネチャ
-GhidraUserSettingsDirに新しくsignaturesが生成され、processorNameごとのDirectoryが生成され、ここに.sigファイルがコピーされる。
-config.jsonに除外対象のファイルが記述される。
+## Usage
+
+### Adding FLIRT Signatures
+
+![Open SigAnalyzer](./images/OpenSigAnalyzer.png)
+
+Select **Tools → SigAnalyzer → Open SigAnalyzer**.
+
+![SigAnalyzer Menu](./images/Menu.png)
+
+From here you can add or remove FLIRT signatures.
+
+## Added FLIRT Signatures
+A new `signatures` folder is created under GhidraUserSettingsDir. Directories are created per processor name, and `.sig` files are copied there. Excluded files are listed in `config.json`.
 
 ## One Shot Analyze
-必要に応じてDemangler MicrosoftやDemangler Rustを実行する必要がある。
-通常のAuto AnalyzeではDemanglerの前にSigAnalyzerが動くようになっているので不要。
+You may need to run **Demangler Microsoft** or **Demangler Rust** as needed. With normal Auto Analyze, SigAnalyzer runs before the Demangler, so this is usually not required.
