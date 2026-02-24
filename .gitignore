@@ -1,0 +1,7 @@
+/.gradle
+/.vscode
+/build
+/dist
+build.gradle
+/bin
+/.cursor
