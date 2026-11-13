@@ -1,12 +1,15 @@
 package siganalyzer.analyzer;
 
 import java.io.DataInputStream;
-import java.io.EOFException;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * Parser for FLIRT signature file headers.
  * Extracts header information including library name, version, and function count.
+ * All fixed header fields, including the version-specific extensions, are little-endian.
+ * Truncated headers or library names are rejected rather than padded with zeroes.
  */
 public class FlirtHeaderParser {
 
@@ -92,8 +95,10 @@ public class FlirtHeaderParser {
 			return v5 != null ? v5.version : 0;
 		}
 
-		public int getFunctionCount() {
-			return v6v7 != null ? v6v7.nFunctions : (v5 != null ? v5.oldNFunctions & 0xFFFF : -1);
+		/** Returns the unsigned function count from the version-appropriate header. */
+		public long getFunctionCount() {
+			return v6v7 != null ? Integer.toUnsignedLong(v6v7.nFunctions)
+					: (v5 != null ? v5.oldNFunctions & 0xFFFF : -1);
 		}
 	}
 
@@ -101,21 +106,7 @@ public class FlirtHeaderParser {
 	 * Reads a byte from the input stream
 	 */
 	private static byte readByte(DataInputStream dis) throws IOException {
-		try {
-			return dis.readByte();
-		}
-		catch (EOFException e) {
-			return 0;
-		}
-	}
-
-	/**
-	 * Reads a short in big-endian format
-	 */
-	private static short readShort(DataInputStream dis) throws IOException {
-		short high = (short) (readByte(dis) & 0xFF);
-		short low = (short) (readByte(dis) & 0xFF);
-		return (short) ((high << 8) | low);
+		return dis.readByte();
 	}
 
 	/**
@@ -133,15 +124,6 @@ public class FlirtHeaderParser {
 	private static int readWordLE(DataInputStream dis) throws IOException {
 		int low = readShortLE(dis) & 0xFFFF;
 		int high = readShortLE(dis) & 0xFFFF;
-		return ((high << 16) | low);
-	}
-
-	/**
-	 * Reads a word (4 bytes) in big-endian format
-	 */
-	private static int readWord(DataInputStream dis) throws IOException {
-		int high = readShort(dis) & 0xFFFF;
-		int low = readShort(dis) & 0xFFFF;
 		return ((high << 16) | low);
 	}
 
@@ -170,7 +152,7 @@ public class FlirtHeaderParser {
 	 */
 	private static IdasigV6V7 parseV6V7Header(DataInputStream dis) throws IOException {
 		IdasigV6V7 header = new IdasigV6V7();
-		header.nFunctions = readWord(dis);
+		header.nFunctions = readWordLE(dis);
 		return header;
 	}
 
@@ -179,7 +161,7 @@ public class FlirtHeaderParser {
 	 */
 	private static IdasigV8V9 parseV8V9Header(DataInputStream dis) throws IOException {
 		IdasigV8V9 header = new IdasigV8V9();
-		header.patternSize = readShort(dis);
+		header.patternSize = readShortLE(dis);
 		return header;
 	}
 
@@ -188,7 +170,7 @@ public class FlirtHeaderParser {
 	 */
 	private static IdasigV10 parseV10Header(DataInputStream dis) throws IOException {
 		IdasigV10 header = new IdasigV10();
-		header.unknown = readShort(dis);
+		header.unknown = readShortLE(dis);
 		return header;
 	}
 
@@ -202,13 +184,8 @@ public class FlirtHeaderParser {
 		try {
 			// Parse V5 header
 			IdasigV5 v5 = parseV5Header(dis);
-			if (v5 == null) {
-				return null;
-			}
-
 			// Verify magic bytes
-			String magic = new String(v5.magic);
-			if (!"IDASGN".equals(magic)) {
+			if (!Arrays.equals(v5.magic, "IDASGN".getBytes(StandardCharsets.US_ASCII))) {
 				return null;
 			}
 
@@ -224,33 +201,19 @@ public class FlirtHeaderParser {
 
 			if (version >= 6) {
 				v6v7 = parseV6V7Header(dis);
-				if (v6v7 == null) {
-					return null;
-				}
-
-				if (version >= 8) {
-					v8v9 = parseV8V9Header(dis);
-					if (v8v9 == null) {
-						return null;
-					}
-
-					if (version >= 10) {
-						v10 = parseV10Header(dis);
-						if (v10 == null) {
-							return null;
-						}
-					}
-				}
+			}
+			if (version >= 8) {
+				v8v9 = parseV8V9Header(dis);
+			}
+			if (version >= 10) {
+				v10 = parseV10Header(dis);
 			}
 
 			// Read library name
-			String libraryName = "Unknown";
-			byte libraryNameLen = v5.libraryNameLen;
-			if (libraryNameLen > 0 && libraryNameLen < 256) {
-				byte[] nameBytes = new byte[libraryNameLen & 0xFF];
-				dis.readFully(nameBytes);
-				libraryName = new String(nameBytes);
-			}
+			int libraryNameLen = Byte.toUnsignedInt(v5.libraryNameLen);
+			byte[] nameBytes = new byte[libraryNameLen];
+			dis.readFully(nameBytes);
+			String libraryName = new String(nameBytes, StandardCharsets.UTF_8);
 
 			return new HeaderInfo(v5, v6v7, v8v9, v10, libraryName);
 		}

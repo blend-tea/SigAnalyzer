@@ -1,0 +1,102 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  GHIDRA_VERSION: '12.2'
+  GHIDRA_ARCHIVE: ghidra_12.2_PUBLIC_20261016.zip
+  GHIDRA_SHA256: 2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Cache Ghidra archive
+        id: ghidra-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/${{ env.GHIDRA_ARCHIVE }}
+          key: ghidra-${{ runner.os }}-${{ env.GHIDRA_SHA256 }}
+      - name: Download Ghidra
+        if: steps.ghidra-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ARCHIVE}" \
+            --output "$RUNNER_TEMP/$GHIDRA_ARCHIVE"
+      - name: Verify and extract Ghidra
+        shell: bash
+        run: |
+          printf '%s  %s\n' "$GHIDRA_SHA256" "$RUNNER_TEMP/$GHIDRA_ARCHIVE" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/ghidra"
+          unzip -q "$RUNNER_TEMP/$GHIDRA_ARCHIVE" -d "$RUNNER_TEMP/ghidra"
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version=//p' gradle.properties)
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Test and build extension
+        env:
+          GHIDRA_INSTALL_DIR: ${{ runner.temp }}/ghidra/ghidra_12.2_PUBLIC
+        run: ./gradlew --no-daemon clean test buildExtension
+      - name: Test packaged extension in headless Ghidra
+        env:
+          GHIDRA_INSTALL_DIR: ${{ runner.temp }}/ghidra/ghidra_12.2_PUBLIC
+        run: src/test/run-headless.sh
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/reports/tests/test/
+          if-no-files-found: ignore
+      - name: Upload extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: SigAnalyzer-Ghidra-${{ env.GHIDRA_VERSION }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SigAnalyzer-Ghidra-${{ env.GHIDRA_VERSION }}
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zip \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zip \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              --title "SigAnalyzer $GITHUB_REF_NAME (Ghidra $GHIDRA_VERSION)"
+          fi

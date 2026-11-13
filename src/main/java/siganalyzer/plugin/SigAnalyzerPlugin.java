@@ -33,8 +33,8 @@ import ghidra.util.HelpLocation;
 	status = PluginStatus.STABLE,
 	packageName = ExamplesPluginPackage.NAME,
 	category = PluginCategoryNames.EXAMPLES,
-	shortDescription = "Plugin short description goes here.",
-	description = "Plugin long description goes here."
+	shortDescription = "Manage FLIRT signatures",
+	description = "Manage IDA FLIRT signatures and apply library function names with SigAnalyzer."
 )
 //@formatter:on
 public class SigAnalyzerPlugin extends ProgramPlugin {
@@ -54,7 +54,7 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 		provider = new SigAnalyzerProvider(this, pluginName);
 
 		// Customize help (or remove if help is not desired)
-		String topicName = this.getClass().getPackage().getName();
+		String topicName = "SigAnalyzer";
 		String anchorName = "HelpAnchor";
 		provider.setHelpLocation(new HelpLocation(topicName, anchorName));
 

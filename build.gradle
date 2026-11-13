@@ -1,0 +1,31 @@
+def ghidraInstallDir = providers.gradleProperty('GHIDRA_INSTALL_DIR')
+    .orElse(providers.environmentVariable('GHIDRA_INSTALL_DIR')).orNull
+
+if (!ghidraInstallDir || !file("${ghidraInstallDir}/support/buildExtension.gradle").isFile()) {
+    throw new GradleException('Set GHIDRA_INSTALL_DIR to an extracted Ghidra installation, or pass -PGHIDRA_INSTALL_DIR=/path/to/ghidra.')
+}
+
+apply from: "${ghidraInstallDir}/support/buildExtension.gradle"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnit()
+    systemProperty 'java.awt.headless', 'true'
+}
+
+tasks.named('buildExtension') {
+    dependsOn tasks.named('check')
+    archiveBaseName = "ghidra_${ghidra_version}_${RELEASE_NAME}_${project.name}-${project.version}"
+    exclude '.git/**', '.github/**', 'gradle/**', 'scripts/**', '.gitignore', '.gitattributes', 'gradle.properties'
+}

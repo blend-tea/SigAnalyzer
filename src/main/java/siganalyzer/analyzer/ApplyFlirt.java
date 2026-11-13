@@ -3,31 +3,39 @@ package siganalyzer.analyzer;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
-import java.io.EOFException;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Set;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
+import ghidra.program.model.address.AddressOutOfBoundsException;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolTable;
+import ghidra.util.exception.CancelledException;
 import ghidra.util.exception.DuplicateNameException;
+import ghidra.util.task.TaskMonitor;
 import ghidra.util.exception.InvalidInputException;
 
 public class ApplyFlirt {
+    private static final int MAX_BUFFER_SIZE = 64 * 1024 * 1024;
     // Ghidra
     FunctionManager functionManager;
     Memory memory;
@@ -35,8 +43,18 @@ public class ApplyFlirt {
     File sigFile;
     /** Set of entry point addresses excluded from rename targets */
     private Set<Address> entryPointAddresses;
+    private TaskMonitor monitor = TaskMonitor.DUMMY;
+    private String errorMessage;
+    private int appliedCount;
+    private final Set<Address> claimedAddresses;
+    private AddressSpace matchingAddressSpace;
 
     public ApplyFlirt(Program program, File sigFile) {
+        this(program, sigFile, new HashSet<>());
+    }
+
+    ApplyFlirt(Program program, File sigFile, Set<Address> claimedAddresses) {
+        this.claimedAddresses = claimedAddresses;
         this.program = program;
         this.sigFile = sigFile;
         this.functionManager = program.getFunctionManager();
@@ -59,24 +77,41 @@ public class ApplyFlirt {
 
     public boolean run() {
         try {
-            Flirt flirt = new Flirt(new DataInputStream(new FileInputStream(sigFile)));
-            FlirtNode node = flirtParse(flirt);
-            if (node == null) {
-                return false;
-            }
-
-            entryPointAddresses = getEntryPointAddresses();
-
-            if (!nodeMatchFunctions(node)) {
-                return false;
-            }
-            else {
-                return true;
-            }
+            return run(TaskMonitor.DUMMY);
         }
-        catch (Exception e) {
+        catch (CancelledException e) {
             return false;
         }
+    }
+
+    public boolean run(TaskMonitor taskMonitor) throws CancelledException {
+        monitor = taskMonitor;
+        errorMessage = null;
+        appliedCount = 0;
+        monitor.checkCancelled();
+        try (DataInputStream input = new DataInputStream(new FileInputStream(sigFile))) {
+            FlirtNode node = flirtParse(new Flirt(input));
+            monitor.checkCancelled();
+            if (node == null) {
+                errorMessage = "Invalid or unsupported FLIRT signature";
+                return false;
+            }
+            entryPointAddresses = getEntryPointAddresses();
+            return nodeMatchFunctions(node);
+        }
+        catch (IOException | IllegalArgumentException e) {
+            monitor.checkCancelled();
+            errorMessage = e.getMessage();
+            return false;
+        }
+    }
+
+    public String getErrorMessage() {
+        return errorMessage;
+    }
+
+    public int getAppliedCount() {
+        return appliedCount;
     }
 
     // Architecture flags
@@ -249,16 +284,16 @@ public class ApplyFlirt {
     pattern_size     : number of the leading pattern bytes
      */
 
-    private static final int R_FLIRT_NAME_MAX = 1024;
+    private static final int R_FLIRT_NAME_MAX = 4096;
 
     private static class FlirtTailByte {
-        short offset;
+        long offset;
         byte value;
     }
 
     private static class FlirtFunction {
         String name;
-        short offset;
+        long offset;
         boolean negativeOffset;
         boolean isLocal;
         boolean isCollision;
@@ -267,7 +302,7 @@ public class ApplyFlirt {
     private static class FlirtModule {
         int crcLength;
         int crc16;
-        short length;
+        long length;
         List<FlirtFunction> publicFunctions;
         List<FlirtTailByte> tailBytes;
         List<FlirtFunction> referencedFunctions;
@@ -405,18 +440,11 @@ public class ApplyFlirt {
     }
 
     private byte readByte(Flirt f) throws IOException {
-        byte r = 0;
-        if (f.bufEof || f.bufErr) {
-            return 0;
+        if (monitor.isCancelled()) {
+            throw new IOException("Cancelled");
         }
-        try {
-            r = f.b.readByte();
-        }
-        catch (EOFException e) {
-            f.bufEof = true;
-            return 0;
-        }
-        return r;
+        // EOF must reject the tree; treating missing bytes as zero can manufacture matches.
+        return f.b.readByte();
     }
 
     private short readShort(Flirt flirt) throws IOException {
@@ -500,85 +528,104 @@ public class ApplyFlirt {
     }
 
 
-    private boolean moduleMatchBuffer(FlirtModule module, byte[] b, long address, int bufSize) {
-        Function nextModuleFunction = null;
-        if (32 + module.crcLength < bufSize) {
-            int calculatedCrc = crc16(b, 32, module.crcLength) & 0xFFFF;
-            int expectedCrc = module.crc16 & 0xFFFF;
-            if (expectedCrc != calculatedCrc) {
-                return false;
-            }
+    private boolean moduleMatchBuffer(FlirtModule module, byte[] b, long address,
+            int bufSize, int patternLength) {
+        int crcOffset = Math.max(32, patternLength);
+        if (module.crcLength > 0 && (crcOffset > bufSize ||
+            module.crcLength > bufSize - crcOffset)) {
+            return false;
+        }
+        if ((module.crc16 & 0xffff) != crc16(b, crcOffset, module.crcLength)) {
+            return false;
         }
         if (module.tailBytes != null) {
             for (FlirtTailByte tailByte : module.tailBytes) {
-                if (32 + module.crcLength + tailByte.offset < bufSize &&
-                    b[32 + module.crcLength + tailByte.offset] != tailByte.value) {
+                long offset = (long) crcOffset + module.crcLength + tailByte.offset;
+                if (offset < 0 || offset >= bufSize || b[(int) offset] != tailByte.value) {
                     return false;
                 }
             }
         }
-
-        // TODO: Implement referenced function handling
-
-        ListIterator<FlirtFunction> functionIt = module.publicFunctions.listIterator();
-        while (functionIt.hasNext()) {
-            FlirtFunction flirtFunction = functionIt.next();
-            long functionAddr = address + flirtFunction.offset;
-            Address addr =
-                program.getAddressFactory().getDefaultAddressSpace().getAddress(functionAddr);
+        // Check every disambiguating constraint before applying any public name.
+        if (module.referencedFunctions != null) {
+            for (FlirtFunction reference : module.referencedFunctions) {
+                if (!referencedFunctionMatches(address, reference)) {
+                    return false;
+                }
+            }
+        }
+        for (FlirtFunction publicFunction : module.publicFunctions) {
+            if (publicFunction.isCollision || publicFunction.name.isEmpty() || publicFunction.name.equals("?")) {
+                continue;
+            }
             try {
-                nextModuleFunction = functionManager.getFunctionAt(addr);
+                Address addr = matchingAddress(address).add(publicFunction.offset);
+                Function function = functionManager.getFunctionAt(addr);
+                if (function == null || entryPointAddresses.contains(addr) || claimedAddresses.contains(addr)) {
+                    continue;
+                }
+                SourceType source = function.getSymbol().getSource();
+                if (source == SourceType.USER_DEFINED || source == SourceType.IMPORTED ||
+                    publicFunction.name.equals(function.getName())) {
+                    continue;
+                }
+                // Leading '?' characters are part of Microsoft C++ mangled names.
+                function.setName(publicFunction.name, SourceType.ANALYSIS);
+                claimedAddresses.add(addr);
+                appliedCount++;
             }
-            catch (Exception e) {
-                nextModuleFunction = null;
-            }
-            if (nextModuleFunction != null) {
-                String name;
-                int nameOffs = 0;
-
-                long flirtFcnSize = module.length - flirtFunction.offset;
-                FlirtFunction nextFlirtFunc;
-                ListIterator<FlirtFunction> nextFlirtFuncIt = functionIt;
-                while (nextFlirtFuncIt.hasNext()) {
-                    nextFlirtFunc = nextFlirtFuncIt.next();
-                    if (!nextFlirtFunc.isLocal && !nextFlirtFunc.negativeOffset) {
-                        flirtFcnSize = nextFlirtFunc.offset - flirtFunction.offset;
-                        break;
-                    }
-                }
-
-                while (nameOffs < flirtFunction.name.length() &&
-                    flirtFunction.name.charAt(nameOffs) == '?') {
-                    nameOffs++;
-                }
-
-                if (nameOffs < flirtFunction.name.length() &&
-                    !entryPointAddresses.contains(nextModuleFunction.getEntryPoint())) {
-                    name = flirtFunction.name.substring(nameOffs);
-
-                    try {
-                        String newName = name;
-                        nextModuleFunction.setName(newName, SourceType.ANALYSIS);
-                    }
-                    catch (DuplicateNameException | InvalidInputException e) {
-                        try {
-                            String newName = name + "_" + System.currentTimeMillis();
-                            nextModuleFunction.setName(newName, SourceType.ANALYSIS);
-                        }
-                        catch (Exception e2) {
-                        }
-                    }
-                }
+            catch (DuplicateNameException | InvalidInputException | IllegalArgumentException |
+                    AddressOutOfBoundsException e) {
+                // An invalid/unusable export must not prevent the other exports being applied.
             }
         }
         return true;
     }
 
-    private boolean nodePatternMatch(FlirtNode node, byte[] b, int bufIndex, int bufSize) {
-        if (bufSize < node.length) {
+    private Address matchingAddress(long offset) {
+        AddressSpace space = matchingAddressSpace != null ? matchingAddressSpace :
+            program.getAddressFactory().getDefaultAddressSpace();
+        return space.getAddress(offset);
+    }
+
+    private boolean referencedFunctionMatches(long address, FlirtFunction reference) {
+        try {
+            Address start = matchingAddress(address);
+            Address refAddress = start.add(reference.negativeOffset ? -reference.offset : reference.offset);
+            Instruction instruction = program.getListing().getInstructionContaining(refAddress);
+            if (instruction == null) {
+                return false;
+            }
+            // The FLIRT offset can point into a relocation operand, not the instruction start.
+            for (Reference target : instruction.getReferencesFrom()) {
+                Address destination = target.getToAddress();
+                Function callee = functionManager.getFunctionAt(destination);
+                if (callee != null) {
+                    if (reference.name.equals(callee.getName())) {
+                        return true;
+                    }
+                    Function thunked = callee.getThunkedFunction(true);
+                    if (thunked != null && reference.name.equals(thunked.getName())) {
+                        return true;
+                    }
+                }
+                for (Symbol symbol : program.getSymbolTable().getSymbols(destination)) {
+                    if (reference.name.equals(symbol.getName())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (IllegalArgumentException | AddressOutOfBoundsException e) {
             return false;
         }
+        return false;
+    }
 
+    private boolean nodePatternMatch(FlirtNode node, byte[] b, int bufIndex, int bufSize) {
+        if (bufIndex < 0 || bufIndex > bufSize || node.length > bufSize - bufIndex) {
+            return false;
+        }
         for (int i = 0; i < node.length; i++) {
             if (!node.variantBoolArray[i] && node.patternBytes[i] != b[bufIndex + i]) {
                 return false;
@@ -589,301 +636,224 @@ public class ApplyFlirt {
 
     private boolean nodeMatchBuffer(FlirtNode node, byte[] b, long addr, int bufSize,
             int bufIndex) {
-        if (nodePatternMatch(node, b, bufIndex, bufSize)) {
-            if (node.childList != null && !node.childList.isEmpty()) {
-                for (FlirtNode child : node.childList) {
-                    if (nodeMatchBuffer(child, b, addr, bufSize, bufIndex + node.length)) {
-                        return true;
-                    }
+        if (!nodePatternMatch(node, b, bufIndex, bufSize)) {
+            return false;
+        }
+        int patternLength = bufIndex + node.length;
+        if (node.childList != null) {
+            for (FlirtNode child : node.childList) {
+                if (nodeMatchBuffer(child, b, addr, bufSize, patternLength)) {
+                    return true;
                 }
             }
-            else if (node.moduleList != null && !node.moduleList.isEmpty()) {
-                for (FlirtModule module : node.moduleList) {
-                    if (moduleMatchBuffer(module, b, addr, bufSize)) {
-                        return true;
-                    }
+        }
+        if (node.moduleList != null) {
+            for (FlirtModule module : node.moduleList) {
+                if (moduleMatchBuffer(module, b, addr, bufSize, patternLength)) {
+                    return true;
                 }
             }
         }
         return false;
     }
 
-    private boolean nodeMatchFunctions(FlirtNode rootNode) {
-        FunctionIterator functions = functionManager.getFunctions(true);
-        for (Function function : functions) {
-            try {
-                byte[] funcBuf = new byte[(int) function.getBody().getNumAddresses()];
-                memory.getBytes(function.getEntryPoint(), funcBuf);
-                for (FlirtNode child : rootNode.childList) {
-                    if (nodeMatchBuffer(child, funcBuf, function.getEntryPoint().getOffset(),
-                        (int) function.getBody().getNumAddresses(), 0)) {
-                        break;
-                    }
-                }
-            }
-            catch (Exception e) {
-                continue;
+    private long maximumMatchExtent(FlirtNode node, long patternLength) {
+        patternLength += node.length;
+        long extent = patternLength;
+        if (node.childList != null) {
+            for (FlirtNode child : node.childList) {
+                extent = Math.max(extent, maximumMatchExtent(child, patternLength));
             }
         }
+        if (node.moduleList != null) {
+            for (FlirtModule module : node.moduleList) {
+                long crcEnd = Math.max(32, patternLength) + module.crcLength;
+                if (module.crcLength > 0) {
+                    extent = Math.max(extent, crcEnd);
+                }
+                for (FlirtTailByte tail : module.tailBytes) {
+                    extent = Math.max(extent, crcEnd + tail.offset + 1);
+                }
+            }
+        }
+        return extent;
+    }
+
+    private boolean nodeMatchFunctions(FlirtNode rootNode) throws CancelledException, IOException {
+        long extent = maximumMatchExtent(rootNode, 0);
+        if (extent > MAX_BUFFER_SIZE) {
+            throw new IOException("FLIRT match extent exceeds the supported 64 MiB buffer size");
+        }
+        byte[] buffer = new byte[(int) extent];
+        // A signature describes an object module, which can span several Ghidra functions.
+        // Read the bytes the signature actually checks, rather than using a function body's
+        // address count (which also gives the wrong length for disjoint bodies).
+        Set<Address> matched = new HashSet<>();
+        boolean progress;
+        do {
+            progress = false;
+            FunctionIterator functions = functionManager.getFunctions(true);
+            for (Function function : functions) {
+                monitor.checkCancelled();
+                if (matched.contains(function.getEntryPoint())) {
+                    continue;
+                }
+                try {
+                    matchingAddressSpace = function.getEntryPoint().getAddressSpace();
+                    int read = memory.getBytes(function.getEntryPoint(), buffer);
+                    if (nodeMatchBuffer(rootNode, buffer, function.getEntryPoint().getOffset(), read, 0)) {
+                        matched.add(function.getEntryPoint());
+                        progress = true;
+                    }
+                }
+                catch (MemoryAccessException | IllegalArgumentException e) {
+                    // Unreadable/uninitialized memory cannot establish a signature match.
+                }
+            }
+            // A later callee match can enable a previously rejected referenced-function match.
+        } while (progress);
         return true;
+    }
+
+    private int readConstraintCount(Flirt f) throws IOException {
+        long count = f.version >= 10 ? Integer.toUnsignedLong(readMultipleBytes(f)) :
+            f.version >= 8 ? readMax2Bytes(f) & 0xffff : 1;
+        // Each record consumes at least two bytes. Reject impossible counts before allocation.
+        if (count > f.b.available() / 2) {
+            throw new IOException("Invalid FLIRT constraint count");
+        }
+        return (int) count;
+    }
+
+    private long readOffset(Flirt f) throws IOException {
+        return f.version >= 9 ? Integer.toUnsignedLong(readMultipleBytes(f)) :
+            readMax2Bytes(f) & 0xffff;
     }
 
     private boolean readModuleTailBytes(Flirt f, FlirtModule module) {
-        byte numberOfTailBytes = 1;
-        FlirtTailByte tailByte = null;
-
-        if (module.tailBytes == null) {
-            module.tailBytes = new ArrayList<>();
+        try {
+            int count = readConstraintCount(f);
+            for (int i = 0; i < count; i++) {
+                FlirtTailByte tail = new FlirtTailByte();
+                tail.offset = readOffset(f);
+                tail.value = readByte(f);
+                module.tailBytes.add(tail);
+            }
+            return true;
         }
-        if (f.version >= 8) {
-            try {
-                numberOfTailBytes = readByte(f);
-            }
-            catch (IOException e) {
-                module.tailBytes.clear();
-                return false;
-            }
+        catch (IOException e) {
+            return false;
         }
-        for (int i = 0; i < numberOfTailBytes; i++) {
-            tailByte = new FlirtTailByte();
-            if (f.version >= 9) {
-                try {
-                    tailByte.offset = (short) readMultipleBytes(f);
-                }
-                catch (IOException e) {
-                    module.tailBytes.clear();
-                    return false;
-                }
-            }
-            else {
-                try {
-                    tailByte.offset = readMax2Bytes(f);
-                }
-                catch (IOException e) {
-                    module.tailBytes.clear();
-                    return false;
-                }
-            }
-            try {
-                tailByte.value = readByte(f);
-            }
-            catch (IOException e) {
-                module.tailBytes.clear();
-                return false;
-            }
-            module.tailBytes.add(tailByte);
-        }
-        return true;
     }
 
     private boolean readModuleReferencedFunctions(Flirt f, FlirtModule module) {
-        int i, j;
-        byte numberOfReferencedFunctions;
-        int refFunctionNameLength;
-        FlirtFunction refFunction = new FlirtFunction();
-
-        if (f.version >= 8) {
-            try {
-                numberOfReferencedFunctions = readByte(f);
+        try {
+            int count = readConstraintCount(f);
+            for (int i = 0; i < count; i++) {
+                FlirtFunction function = new FlirtFunction();
+                function.offset = readOffset(f);
+                long length = readByte(f) & 0xff;
+                if (length == 0) {
+                    length = Integer.toUnsignedLong(readMultipleBytes(f));
+                }
+                if (length == 0 || length >= R_FLIRT_NAME_MAX) {
+                    return false;
+                }
+                byte[] name = new byte[(int) length];
+                f.b.readFully(name);
+                function.negativeOffset = name[name.length - 1] == 0;
+                int nameLength = function.negativeOffset ? name.length - 1 : name.length;
+                function.name = new String(name, 0, nameLength, StandardCharsets.ISO_8859_1);
+                if (function.name.isEmpty()) {
+                    return false;
+                }
+                module.referencedFunctions.add(function);
             }
-            catch (IOException e) {
-                return false;
-            }
+            return true;
         }
-        else {
-            numberOfReferencedFunctions = 1;
+        catch (IOException e) {
+            return false;
         }
-
-        for (i = 0; i < numberOfReferencedFunctions; i++) {
-            refFunction = new FlirtFunction();
-            refFunction.name = "";
-            if (f.version >= 9) {
-                try {
-                    refFunction.offset = (short) (readMultipleBytes(f) & 0xFFFF);
-                }
-                catch (IOException e) {
-                    return false;
-                }
-            }
-            else {
-                try {
-                    refFunction.offset = (short) (readMax2Bytes(f) & 0xFFFF);
-                }
-                catch (IOException e) {
-                    return false;
-                }
-            }
-            try {
-                refFunctionNameLength = readByte(f) & 0xFF;
-            }
-            catch (IOException e) {
-                return false;
-            }
-            if (refFunctionNameLength == 0) {
-                try {
-                    refFunctionNameLength = readMultipleBytes(f);
-                }
-                catch (IOException e) {
-                    return false;
-                }
-            }
-            if ((long) (refFunctionNameLength & 0xFFFFFFFFL) < 0 ||
-                refFunctionNameLength >= R_FLIRT_NAME_MAX) {
-                return false;
-            }
-            for (j = 0; j < refFunctionNameLength; j++) {
-                try {
-                    refFunction.name += (char) readByte(f);
-                }
-                catch (IOException e) {
-                    return false;
-                }
-            }
-            if (refFunction.name.charAt(refFunctionNameLength - 1) == 0) {
-                refFunction.negativeOffset = true;
-            }
-            module.referencedFunctions.add(refFunction);
-        }
-        return true;
     }
 
     private boolean readModulePublicFunctions(Flirt f, FlirtModule module, byte[] outFlags) {
-        int i;
-        short offset = 0;
-        byte currentByte;
-        byte flags = 0;
-
-        do {
-            FlirtFunction function = new FlirtFunction();
-            function.name = "";
-            if (f.version >= 9) {
-                try {
-                    offset += readMultipleBytes(f);
-                }
-                catch (IOException e) {
+        try {
+            long offset = 0;
+            int flags;
+            do {
+                FlirtFunction function = new FlirtFunction();
+                offset += readOffset(f);
+                if (offset > 0xffffffffL) {
                     return false;
                 }
-            }
-            else {
-                try {
-                    offset += readMax2Bytes(f);
+                function.offset = offset;
+                int current = readByte(f) & 0xff;
+                if (current < 0x20) {
+                    function.isLocal = (current & IDASIG_FUNCTION_LOCAL) != 0;
+                    function.isCollision = (current & IDASIG_FUNCTION_UNRESOLVED_COLLISION) != 0;
+                    current = readByte(f) & 0xff;
                 }
-                catch (IOException e) {
+                StringBuilder name = new StringBuilder();
+                while (current >= 0x20) {
+                    if (name.length() >= R_FLIRT_NAME_MAX) {
+                        return false;
+                    }
+                    name.append((char) current);
+                    current = readByte(f) & 0xff;
+                }
+                if (name.length() == 0) {
                     return false;
                 }
-            }
-            function.offset = (short) offset;
-
-            try {
-                currentByte = readByte(f);
-            }
-            catch (IOException e) {
-                return false;
-            }
-            if (currentByte < 0x20) {
-                if ((currentByte & IDASIG_FUNCTION_LOCAL) != 0) {
-                    function.isLocal = true;
-                }
-                if ((currentByte & IDASIG_FUNCTION_UNRESOLVED_COLLISION) != 0) {
-                    function.isCollision = true;
-                }
-                try {
-                    currentByte = readByte(f);
-                }
-                catch (IOException e) {
-                    return false;
-                }
-            }
-            for (i = 0; currentByte >= 0x20 && i < R_FLIRT_NAME_MAX; i++) {
-                function.name += (char) currentByte;
-                try {
-                    currentByte = readByte(f);
-                }
-                catch (IOException e) {
-                    return false;
-                }
-            }
-
-            flags = currentByte;
-            module.publicFunctions.add(function);
+                function.name = name.toString();
+                flags = current;
+                module.publicFunctions.add(function);
+            } while ((flags & IDASIG_PARSE_MORE_PUBLIC_NAMES) != 0);
+            outFlags[0] = (byte) flags;
+            return true;
         }
-        while ((flags & IDASIG_PARSE_MORE_PUBLIC_NAMES) != 0);
-
-        outFlags[0] = flags;
-        return true;
+        catch (IOException e) {
+            return false;
+        }
     }
 
     private boolean parseLeaf(Flirt f, FlirtNode node) {
-        byte flags = 0;
-        byte[] flagsArray = new byte[1];
-
         node.moduleList = new ArrayList<>();
-
-        do {
-            byte crcLength;
-            try {
-                crcLength = readByte(f);
-            }
-            catch (IOException e) {
-                return false;
-            }
-            short crc16;
-            try {
-                crc16 = readShort(f);
-            }
-            catch (IOException e) {
-                return false;
-            }
+        byte[] flags = new byte[1];
+        try {
             do {
-                FlirtModule module = new FlirtModule();
-
-                module.publicFunctions = new ArrayList<>();
-                module.tailBytes = new ArrayList<>();
-                module.referencedFunctions = new ArrayList<>();
-
-                module.crcLength = crcLength;
-                module.crc16 = crc16;
-                if (f.version >= 9) {
-                    try {
-                        module.length = (short) readMultipleBytes(f);
-                    }
-                    catch (IOException e) {
+                int crcLength = readByte(f) & 0xff;
+                int expectedCrc = readShort(f) & 0xffff;
+                do {
+                    FlirtModule module = new FlirtModule();
+                    module.publicFunctions = new ArrayList<>();
+                    module.tailBytes = new ArrayList<>();
+                    module.referencedFunctions = new ArrayList<>();
+                    module.crcLength = crcLength;
+                    module.crc16 = expectedCrc;
+                    module.length = readOffset(f);
+                    if (!readModulePublicFunctions(f, module, flags) ||
+                        ((flags[0] & IDASIG_PARSE_READ_TAIL_BYTES) != 0 &&
+                            !readModuleTailBytes(f, module)) ||
+                        ((flags[0] & IDASIG_PARSE_READ_REFERENCED_FUNCTIONS) != 0 &&
+                            !readModuleReferencedFunctions(f, module))) {
                         return false;
                     }
-                }
-                else {
-                    try {
-                        module.length = readMax2Bytes(f);
-                    }
-                    catch (IOException e) {
-                        return false;
-                    }
-                }
-                if (!readModulePublicFunctions(f, module, flagsArray)) {
-                    return false;
-                }
-                flags = flagsArray[0];
-                if ((flags & IDASIG_PARSE_READ_TAIL_BYTES) != 0) {
-                    if (!readModuleTailBytes(f, module)) {
-                        return false;
-                    }
-                }
-                if ((flags & IDASIG_PARSE_READ_REFERENCED_FUNCTIONS) != 0) {
-                    if (!readModuleReferencedFunctions(f, module)) {
-                        return false;
-                    }
-                }
-                node.moduleList.add(module);
-            }
-            while ((flags & IDASIG_PARSE_MORE_MODULES_WITH_SAME_CRC) != 0);
+                    node.moduleList.add(module);
+                } while ((flags[0] & IDASIG_PARSE_MORE_MODULES_WITH_SAME_CRC) != 0);
+            } while ((flags[0] & IDASIG_PARSE_MORE_MODULES) != 0);
+            return true;
         }
-        while ((flags & IDASIG_PARSE_MORE_MODULES) != 0);
-        return true;
+        catch (IOException e) {
+            return false;
+        }
     }
 
     private boolean readNodeLength(Flirt f, FlirtNode node) {
         try {
             node.length = readByte(f) & 0xFF;
+            if (node.length == 0 || node.length > 64) {
+                return false;
+            }
         }
         catch (IOException e) {
             return false;
@@ -900,9 +870,10 @@ public class ApplyFlirt {
                 node.variantMask = readMultipleBytes(f) & 0xFFFFFFFFL;
             }
             else if (node.length <= 0x40) {
-                node.variantMask = ((long) readMultipleBytes(f) << 32) | readMultipleBytes(f);
+                node.variantMask = (Integer.toUnsignedLong(readMultipleBytes(f)) << 32) |
+                    Integer.toUnsignedLong(readMultipleBytes(f));
             }
-            return true;
+            return node.length == 64 || (node.variantMask >>> node.length) == 0;
         }
         catch (IOException e) {
             return false;
@@ -914,7 +885,7 @@ public class ApplyFlirt {
         if (node.length < 0) {
             return false;
         }
-        if (node.length > 63) {
+        if (node.length > 64) {
             return false;
         }
 
@@ -922,7 +893,7 @@ public class ApplyFlirt {
         node.variantBoolArray = new boolean[node.length];
 
         long currentMaskBit = 1L << (node.length - 1);
-        for (i = 0; i < node.length; i++, currentMaskBit >>= 1) {
+        for (i = 0; i < node.length; i++, currentMaskBit >>>= 1) {
             node.variantBoolArray[i] = (node.variantMask & currentMaskBit) != 0;
             if ((node.variantMask & currentMaskBit) != 0) {
                 node.patternBytes[i] = 0;
@@ -940,38 +911,36 @@ public class ApplyFlirt {
     }
 
     private boolean parseTree(Flirt f, FlirtNode rootNode) {
-        int i, treeNodes;
+        return parseTree(f, rootNode, 0);
+    }
+
+    private boolean parseTree(Flirt f, FlirtNode rootNode, int depth) {
         try {
-            treeNodes = readMultipleBytes(f);
+            // Bound recursion on malformed files before the Java stack can overflow.
+            if (depth > 256) {
+                return false;
+            }
+            long count = Integer.toUnsignedLong(readMultipleBytes(f));
+            if (count == 0) {
+                return parseLeaf(f, rootNode);
+            }
+            if (count > f.b.available() / 3) {
+                return false;
+            }
+            rootNode.childList = new ArrayList<>();
+            for (long i = 0; i < count; i++) {
+                FlirtNode child = new FlirtNode();
+                if (!readNodeLength(f, child) || !readNodeVariantMask(f, child) ||
+                    !readNodeBytes(f, child) || !parseTree(f, child, depth + 1)) {
+                    return false;
+                }
+                rootNode.childList.add(child);
+            }
+            return true;
         }
         catch (IOException e) {
             return false;
         }
-
-        if (treeNodes == 0) {
-            return parseLeaf(f, rootNode);
-        }
-
-        rootNode.childList = new ArrayList<>();
-        for (i = 0; i < treeNodes; i++) {
-            FlirtNode node = new FlirtNode();
-
-            if (!readNodeLength(f, node)) {
-                return false;
-            }
-            if (!readNodeVariantMask(f, node)) {
-                return false;
-            }
-            if (!readNodeBytes(f, node)) {
-                return false;
-            }
-            rootNode.childList.add(node);
-
-            if (!parseTree(f, node)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private FlirtNode flirtParse(Flirt f) {
@@ -1029,7 +998,7 @@ public class ApplyFlirt {
         catch (IOException e) {
             return null;
         }
-        if (size < 1) {
+        if (size < 1 || size > MAX_BUFFER_SIZE) {
             return null;
         }
         buf = new byte[size];
@@ -1052,10 +1021,11 @@ public class ApplyFlirt {
                 return null;
             }
 
-            if (dbuf != null) {
-                buf = dbuf;
-                size = dbuf.length;
+            if (dbuf == null) {
+                return null;
             }
+            buf = dbuf;
+            size = dbuf.length;
         }
 
         node = new FlirtNode();
@@ -1064,107 +1034,55 @@ public class ApplyFlirt {
 
         f.b = new DataInputStream(new ByteArrayInputStream(buf));
 
-        if (parseTree(f, node)) {
-            ret = node;
+        try {
+            if (parseTree(f, node) && f.b.available() == 0) {
+                ret = node;
+            }
         }
-        else {
-            node = null;
+        catch (IOException e) {
+            return null;
         }
 
         return ret;
     }
 
     private byte[] inflateRaw(byte[] input, int inputLength) {
-        try {
-            Inflater inflater = new Inflater(true);
-            inflater.setInput(input, 0, inputLength);
-
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream(inputLength * 4);
-            byte[] buffer = new byte[1024];
-
-            while (!inflater.finished()) {
-                int count = 0;
-                try {
-                    count = inflater.inflate(buffer);
-                }
-                catch (DataFormatException e) {
-                    inflater.end();
-                    inflater = new Inflater();
-                    inflater.setInput(input, 0, inputLength);
-                    outputStream.reset();
-
-                    try {
-                        while (!inflater.finished()) {
-                            count = inflater.inflate(buffer);
-                            if (count > 0) {
-                                outputStream.write(buffer, 0, count);
-                            }
-                        }
-                        inflater.end();
-                        return outputStream.toByteArray();
-                    }
-                    catch (DataFormatException e2) {
-                        inflater.end();
-                        return null;
-                    }
-                }
-                if (count > 0) {
-                    outputStream.write(buffer, 0, count);
-                }
-            }
-
-            inflater.end();
-            return outputStream.toByteArray();
-        }
-        catch (Exception e) {
-            return null;
-        }
+        byte[] inflated = inflateData(input, inputLength, true);
+        return inflated != null ? inflated : inflateData(input, inputLength, false);
     }
 
     private byte[] inflate(byte[] input, int inputLength) {
+        byte[] inflated = inflateData(input, inputLength, false);
+        return inflated != null ? inflated : inflateData(input, inputLength, true);
+    }
+
+    private byte[] inflateData(byte[] input, int inputLength, boolean raw) {
+        Inflater inflater = new Inflater(raw);
         try {
-            Inflater inflater = new Inflater();
             inflater.setInput(input, 0, inputLength);
-
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream(inputLength * 4);
-            byte[] buffer = new byte[1024];
-
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
             while (!inflater.finished()) {
-                int count = 0;
-                try {
-                    count = inflater.inflate(buffer);
+                if (monitor.isCancelled()) {
+                    return null;
                 }
-                catch (DataFormatException e) {
-                    inflater.end();
-                    inflater = new Inflater(true);
-                    inflater.setInput(input, 0, inputLength);
-                    outputStream.reset();
-
-                    try {
-                        while (!inflater.finished()) {
-                            count = inflater.inflate(buffer);
-                            if (count > 0) {
-                                outputStream.write(buffer, 0, count);
-                            }
-                        }
-                        inflater.end();
-                        return outputStream.toByteArray();
-                    }
-                    catch (DataFormatException e2) {
-                        inflater.end();
-                        return null;
-                    }
+                int count = inflater.inflate(buffer);
+                if (count == 0 && !inflater.finished()) {
+                    // Truncated input/dictionaries cannot make progress. Never spin forever.
+                    return null;
                 }
-                if (count > 0) {
-                    outputStream.write(buffer, 0, count);
+                if (output.size() > MAX_BUFFER_SIZE - count) {
+                    return null;
                 }
+                output.write(buffer, 0, count);
             }
-
-            inflater.end();
-            return outputStream.toByteArray();
+            return inflater.getRemaining() == 0 ? output.toByteArray() : null;
         }
-        catch (Exception e) {
+        catch (DataFormatException e) {
             return null;
+        }
+        finally {
+            inflater.end();
         }
     }
 

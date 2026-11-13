@@ -19,7 +19,12 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 import com.google.gson.Gson;
@@ -28,13 +33,14 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonParseException;
 
 import ghidra.app.services.AbstractAnalyzer;
 import ghidra.app.services.AnalysisPriority;
 import ghidra.app.services.AnalyzerType;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.framework.Application;
-import ghidra.framework.options.Options;
+import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Program;
 import ghidra.util.exception.CancelledException;
@@ -73,46 +79,48 @@ public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
 	}
 
 	@Override
-	public void registerOptions(Options options, Program program) {
-
-		// If this analyzer has custom options, register them here
-
-		options.registerOption("Option name goes here", false, null,
-			"Option description goes here");
-	}
-
-	@Override
-	public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log) throws CancelledException {
-
-		// Perform analysis when things get added to the 'program'.  Return true if the
-		// analysis succeeded.
-
+	public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log)
+			throws CancelledException {
 		String processorName = program.getLanguage().getProcessor().toString();
 		File sigDir = new File(Application.getUserSettingsDirectory(), "signatures/" + processorName);
-		if (!sigDir.exists()) {
-			sigDir.mkdirs();
-		}
-
-		// Load config.json and get disabled files list
-		Set<String> disabledFiles = loadDisabledFiles(sigDir);
-
-		File[] sigFiles = sigDir.listFiles();
-		if (sigFiles == null) {
+		if (!sigDir.isDirectory() && !sigDir.mkdirs()) {
+			log.appendMsg("SigAnalyzer", "Cannot create signature directory: " + sigDir);
 			return false;
 		}
-
+		Set<String> disabledFiles = loadDisabledFiles(sigDir);
+		File[] sigFiles = sigDir.listFiles(file -> file.isFile() &&
+			file.getName().toLowerCase(Locale.ROOT).endsWith(".sig"));
+		if (sigFiles == null) {
+			log.appendMsg("SigAnalyzer", "Cannot list signature directory: " + sigDir);
+			return false;
+		}
+		Arrays.sort(sigFiles, Comparator.comparing(File::getName));
+		Set<Address> claimedAddresses = new HashSet<>();
+		List<ApplyFlirt> signatures = new ArrayList<>();
 		for (File sigFile : sigFiles) {
-			if (sigFile.getName().endsWith(".sig")) {
-				// Check if this file is in the disabled list
-				String absolutePath = sigFile.getAbsolutePath();
-				if (disabledFiles.contains(absolutePath)) {
-					continue; // Skip disabled files
-				}
-				ApplyFlirt applyFlirt = new ApplyFlirt(program, sigFile);
-				applyFlirt.run();
+			if (!disabledFiles.contains(sigFile.getAbsolutePath())) {
+				signatures.add(new ApplyFlirt(program, sigFile, claimedAddresses));
 			}
 		}
-		return false;
+		boolean success = true;
+		boolean progress;
+		do {
+			progress = false;
+			for (var iterator = signatures.iterator(); iterator.hasNext();) {
+				monitor.checkCancelled();
+				ApplyFlirt signature = iterator.next();
+				monitor.setMessage("Applying FLIRT signature: " + signature.sigFile.getName());
+				if (!signature.run(monitor)) {
+					log.appendMsg("SigAnalyzer", signature.sigFile.getName() + ": " + signature.getErrorMessage());
+					iterator.remove();
+					success = false;
+				}
+				progress |= signature.getAppliedCount() > 0;
+			}
+			// Repeat when a callee in a later file can now satisfy an earlier file's reference.
+			// Shared claimed addresses make the first confirmed name stable across passes.
+		} while (progress);
+		return success;
 	}
 
 	/**
@@ -138,14 +146,14 @@ public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
 				if (jsonObject.has("Disable") && jsonObject.get("Disable").isJsonArray()) {
 					JsonArray disableArray = jsonObject.getAsJsonArray("Disable");
 					for (JsonElement element : disableArray) {
-						if (element.isJsonPrimitive()) {
+						if (element.isJsonPrimitive() && element.getAsJsonPrimitive().isString()) {
 							disabledFiles.add(element.getAsString());
 						}
 					}
 				}
 			}
 		}
-		catch (IOException e) {
+		catch (IOException | JsonParseException e) {
 			// If reading fails, return empty set
 		}
 
