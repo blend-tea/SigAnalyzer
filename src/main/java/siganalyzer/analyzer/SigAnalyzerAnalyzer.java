@@ -40,15 +40,12 @@ import ghidra.app.services.AnalysisPriority;
 import ghidra.app.services.AnalyzerType;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.framework.Application;
-import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Program;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
-/**
- * Provide class-level documentation that describes what this analyzer does.
- */
+/** Apply FLIRT after Function ID has had the first opportunity to identify functions. */
 public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
 
 	public SigAnalyzerAnalyzer() {
@@ -56,8 +53,8 @@ public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
 		// Name the analyzer and give it a description.
 
 		super("SigAnalyzer", "Signature Analyzer", AnalyzerType.BYTE_ANALYZER);
-		// Set priority to run before Demangler analyzers (Rust and Microsoft)
-		setPriority(AnalysisPriority.FUNCTION_ID_ANALYSIS.before());
+		// FID runs at FUNCTION_ID_ANALYSIS.before(); demanglers run later.
+		setPriority(AnalysisPriority.FUNCTION_ID_ANALYSIS);
 		setSupportsOneTimeAnalysis(true);
 	}
 
@@ -95,31 +92,17 @@ public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
 			return false;
 		}
 		Arrays.sort(sigFiles, Comparator.comparing(File::getName));
-		Set<Address> claimedAddresses = new HashSet<>();
-		List<ApplyFlirt> signatures = new ArrayList<>();
+		List<File> signatures = new ArrayList<>();
 		for (File sigFile : sigFiles) {
 			if (!disabledFiles.contains(sigFile.getAbsolutePath())) {
-				signatures.add(new ApplyFlirt(program, sigFile, claimedAddresses));
+				signatures.add(sigFile);
 			}
 		}
-		boolean success = true;
-		boolean progress;
-		do {
-			progress = false;
-			for (var iterator = signatures.iterator(); iterator.hasNext();) {
-				monitor.checkCancelled();
-				ApplyFlirt signature = iterator.next();
-				monitor.setMessage("Applying FLIRT signature: " + signature.sigFile.getName());
-				if (!signature.run(monitor)) {
-					log.appendMsg("SigAnalyzer", signature.sigFile.getName() + ": " + signature.getErrorMessage());
-					iterator.remove();
-					success = false;
-				}
-				progress |= signature.getAppliedCount() > 0;
-			}
-			// Repeat when a callee in a later file can now satisfy an earlier file's reference.
-			// Shared claimed addresses make the first confirmed name stable across passes.
-		} while (progress);
+		FlirtAnalysisSession session = new FlirtAnalysisSession(program);
+		boolean success = session.run(signatures, monitor, log);
+		monitor.checkCancelled();
+		// Valid files can still produce a useful report when another file was invalid.
+		FlirtAnalysisResults.publish(program, session.getConflicts());
 		return success;
 	}
 

@@ -884,4 +884,11 @@ public class SigAnalyzerProvider extends ComponentProvider {
 	public JComponent getComponent() {
 		return panel;
 	}
+
+	public void dispose() {
+		filterPanel.dispose();
+		if (isInTool()) {
+			removeFromTool();
+		}
+	}
 }

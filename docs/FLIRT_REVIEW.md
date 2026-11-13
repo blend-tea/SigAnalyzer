@@ -1,6 +1,6 @@
 # FLIRT implementation review
 
-Reviewed for SigAnalyzer 0.2.0 against these implementations:
+Reviewed for SigAnalyzer 0.2.0 and extended in 0.3.0 against these implementations:
 
 - [angr FLIRT parser](https://github.com/angr/angr/blob/8d4cbc652db70a6444a40b90c47326193c10d81b/angr/analyses/flirt/flirt_sig.py)
   and [matcher](https://github.com/angr/angr/blob/8d4cbc652db70a6444a40b90c47326193c10d81b/angr/analyses/flirt/flirt_matcher.py).
@@ -23,6 +23,9 @@ proprietary signature files are included in the regression suite.
 | References | Check referenced function names through Ghidra references before naming a module. Unresolved references defer the match. |
 | Module memory | Read the contiguous bytes required by a signature module, including bytes beyond the first function's body, instead of assuming a module contains one function. |
 | Analyzer lifecycle | Close signature streams, support cancellation, report invalid files and return a meaningful analysis status. |
+| Function ID | Run at priority 800, after FID (799). Protect FID analysis bookmarks, its single/multiple-match plate comments and conflict labels, including when bookmark creation is disabled. |
+| Multiple candidates | Collect every matching module and trie branch across all enabled files before mutation. Prune impossible reference dependencies; apply only globally unique names supported by resolved callees. Report different names without renaming. |
+| Provenance | Append/update a delimited FLIRT plate-comment block with all agreeing signature sources, preserving unrelated comments. |
 
 The analyzer operates on functions already discovered by Ghidra. It does not
 create functions, infer missing reference targets, or relax byte comparisons.

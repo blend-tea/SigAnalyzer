@@ -23,5 +23,14 @@
     one-shot analysis. Run the appropriate demangler afterwards when using one-shot analysis.</P>
     <P>Signatures must match the program's architecture and ABI. A signature with
     an unresolved referenced function is skipped until that reference can be verified.</P>
+    <P>SigAnalyzer runs after Function ID. Functions already identified by Function ID
+    are excluded. Unique FLIRT matches receive a function-entry comment listing their
+    signature files and libraries; existing comments are retained.</P>
+    <H2><a name="FlirtConflicts"></a>FLIRT Conflicts</H2>
+    <P>Different matching names leave the current function name and comment unchanged.
+    The FLIRT Conflicts window opens after analysis and lists each candidate with its
+    address, signature file and library. Double-click a row or press Enter to navigate
+    to its function. Use <B>Tools &gt; SigAnalyzer &gt; FLIRT Conflicts</B> to reopen the
+    latest report. Several signatures agreeing on one name do not create a conflict.</P>
   </BODY>
 </HTML>

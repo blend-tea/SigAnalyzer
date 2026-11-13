@@ -9,11 +9,15 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 
+import ghidra.app.util.importer.MessageLog;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressOutOfBoundsException;
@@ -29,10 +33,10 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolTable;
+import ghidra.program.model.symbol.SymbolUtilities;
 import ghidra.util.exception.CancelledException;
-import ghidra.util.exception.DuplicateNameException;
-import ghidra.util.task.TaskMonitor;
 import ghidra.util.exception.InvalidInputException;
+import ghidra.util.task.TaskMonitor;
 
 public class ApplyFlirt {
     private static final int MAX_BUFFER_SIZE = 64 * 1024 * 1024;
@@ -46,15 +50,11 @@ public class ApplyFlirt {
     private TaskMonitor monitor = TaskMonitor.DUMMY;
     private String errorMessage;
     private int appliedCount;
-    private final Set<Address> claimedAddresses;
+    private final List<FlirtAnalysisSession.ModuleMatch> collectedMatches = new ArrayList<>();
+    private String libraryName = "";
     private AddressSpace matchingAddressSpace;
 
     public ApplyFlirt(Program program, File sigFile) {
-        this(program, sigFile, new HashSet<>());
-    }
-
-    ApplyFlirt(Program program, File sigFile, Set<Address> claimedAddresses) {
-        this.claimedAddresses = claimedAddresses;
         this.program = program;
         this.sigFile = sigFile;
         this.functionManager = program.getFunctionManager();
@@ -85,24 +85,30 @@ public class ApplyFlirt {
     }
 
     public boolean run(TaskMonitor taskMonitor) throws CancelledException {
+        FlirtAnalysisSession session = new FlirtAnalysisSession(program);
+        boolean success = session.run(List.of(sigFile), taskMonitor, new MessageLog());
+        appliedCount = session.getAppliedCount();
+        errorMessage = session.getErrorMessage();
+        taskMonitor.checkCancelled();
+        FlirtAnalysisResults.publish(program, session.getConflicts());
+        return success;
+    }
+
+    /** Collect every byte-matching module without changing program names or comments. */
+    List<FlirtAnalysisSession.ModuleMatch> collectMatches(TaskMonitor taskMonitor)
+            throws CancelledException, IOException {
         monitor = taskMonitor;
-        errorMessage = null;
-        appliedCount = 0;
+        collectedMatches.clear();
         monitor.checkCancelled();
         try (DataInputStream input = new DataInputStream(new FileInputStream(sigFile))) {
             FlirtNode node = flirtParse(new Flirt(input));
             monitor.checkCancelled();
             if (node == null) {
-                errorMessage = "Invalid or unsupported FLIRT signature";
-                return false;
+                throw new IOException("Invalid or unsupported FLIRT signature");
             }
             entryPointAddresses = getEntryPointAddresses();
-            return nodeMatchFunctions(node);
-        }
-        catch (IOException | IllegalArgumentException e) {
-            monitor.checkCancelled();
-            errorMessage = e.getMessage();
-            return false;
+            nodeMatchFunctions(node);
+            return List.copyOf(collectedMatches);
         }
     }
 
@@ -546,14 +552,18 @@ public class ApplyFlirt {
                 }
             }
         }
-        // Check every disambiguating constraint before applying any public name.
+        // Capture reference constraints now; resolve them after every signature was scanned.
+        List<FlirtAnalysisSession.ReferenceConstraint> constraints = new ArrayList<>();
         if (module.referencedFunctions != null) {
             for (FlirtFunction reference : module.referencedFunctions) {
-                if (!referencedFunctionMatches(address, reference)) {
+                var constraint = referenceConstraint(address, reference);
+                if (constraint == null) {
                     return false;
                 }
+                constraints.add(constraint);
             }
         }
+        List<FlirtCandidate> candidates = new ArrayList<>();
         for (FlirtFunction publicFunction : module.publicFunctions) {
             if (publicFunction.isCollision || publicFunction.name.isEmpty() || publicFunction.name.equals("?")) {
                 continue;
@@ -561,23 +571,24 @@ public class ApplyFlirt {
             try {
                 Address addr = matchingAddress(address).add(publicFunction.offset);
                 Function function = functionManager.getFunctionAt(addr);
-                if (function == null || entryPointAddresses.contains(addr) || claimedAddresses.contains(addr)) {
+                if (function == null || entryPointAddresses.contains(addr) ||
+                    FlirtFunctionMarkup.isFunctionId(function)) {
                     continue;
                 }
                 SourceType source = function.getSymbol().getSource();
-                if (source == SourceType.USER_DEFINED || source == SourceType.IMPORTED ||
-                    publicFunction.name.equals(function.getName())) {
+                if (source == SourceType.USER_DEFINED || source == SourceType.IMPORTED) {
                     continue;
                 }
-                // Leading '?' characters are part of Microsoft C++ mangled names.
-                function.setName(publicFunction.name, SourceType.ANALYSIS);
-                claimedAddresses.add(addr);
-                appliedCount++;
+                SymbolUtilities.validateName(publicFunction.name);
+                candidates.add(new FlirtCandidate(addr, publicFunction.name,
+                    sigFile.getName(), libraryName));
             }
-            catch (DuplicateNameException | InvalidInputException | IllegalArgumentException |
-                    AddressOutOfBoundsException e) {
-                // An invalid/unusable export must not prevent the other exports being applied.
+            catch (IllegalArgumentException | AddressOutOfBoundsException | InvalidInputException e) {
+                // A bad export address must not prevent other exports being considered.
             }
+        }
+        if (!candidates.isEmpty()) {
+            collectedMatches.add(new FlirtAnalysisSession.ModuleMatch(candidates, constraints));
         }
         return true;
     }
@@ -588,38 +599,70 @@ public class ApplyFlirt {
         return space.getAddress(offset);
     }
 
-    private boolean referencedFunctionMatches(long address, FlirtFunction reference) {
+    private FlirtAnalysisSession.ReferenceConstraint referenceConstraint(long address,
+            FlirtFunction reference) {
         try {
             Address start = matchingAddress(address);
             Address refAddress = start.add(reference.negativeOffset ? -reference.offset : reference.offset);
             Instruction instruction = program.getListing().getInstructionContaining(refAddress);
             if (instruction == null) {
-                return false;
+                return null;
             }
-            // The FLIRT offset can point into a relocation operand, not the instruction start.
+            Set<Address> targets = new LinkedHashSet<>();
+            Set<String> knownNames = new LinkedHashSet<>();
+            Map<Address, Set<String>> existingNames = new LinkedHashMap<>();
+            // Relocations can point inside an instruction's operand.
             for (Reference target : instruction.getReferencesFrom()) {
                 Address destination = target.getToAddress();
+                targets.add(destination);
                 Function callee = functionManager.getFunctionAt(destination);
+                boolean priorFlirt = callee != null && FlirtFunctionMarkup.isFlirt(callee) &&
+                    !FlirtFunctionMarkup.isFunctionId(callee);
                 if (callee != null) {
-                    if (reference.name.equals(callee.getName())) {
-                        return true;
+                    if (!priorFlirt) {
+                        addExistingName(callee.getEntryPoint(), callee.getName(),
+                            isTrustedName(callee), knownNames, existingNames);
                     }
                     Function thunked = callee.getThunkedFunction(true);
-                    if (thunked != null && reference.name.equals(thunked.getName())) {
-                        return true;
+                    if (thunked != null) {
+                        targets.add(thunked.getEntryPoint());
+                        if (!FlirtFunctionMarkup.isFlirt(thunked) || FlirtFunctionMarkup.isFunctionId(thunked)) {
+                            addExistingName(thunked.getEntryPoint(), thunked.getName(),
+                                isTrustedName(thunked), knownNames, existingNames);
+                        }
                     }
                 }
                 for (Symbol symbol : program.getSymbolTable().getSymbols(destination)) {
-                    if (reference.name.equals(symbol.getName())) {
-                        return true;
+                    if (!priorFlirt || symbol.getSource() != SourceType.ANALYSIS) {
+                        boolean trusted = symbol.getSource() == SourceType.USER_DEFINED ||
+                            symbol.getSource() == SourceType.IMPORTED ||
+                            (callee != null && FlirtFunctionMarkup.isFunctionId(callee));
+                        addExistingName(destination, symbol.getName(), trusted, knownNames, existingNames);
                     }
                 }
             }
+            return targets.isEmpty() ? null : new FlirtAnalysisSession.ReferenceConstraint(
+                reference.name, List.copyOf(targets), Set.copyOf(knownNames), existingNames);
         }
         catch (IllegalArgumentException | AddressOutOfBoundsException e) {
-            return false;
+            return null;
         }
-        return false;
+    }
+
+    private static boolean isTrustedName(Function function) {
+        SourceType source = function.getSymbol().getSource();
+        return source == SourceType.USER_DEFINED || source == SourceType.IMPORTED ||
+            FlirtFunctionMarkup.isFunctionId(function);
+    }
+
+    private static void addExistingName(Address address, String name, boolean trusted,
+            Set<String> knownNames, Map<Address, Set<String>> existingNames) {
+        if (trusted) {
+            knownNames.add(name);
+        }
+        else {
+            existingNames.computeIfAbsent(address, key -> new LinkedHashSet<>()).add(name);
+        }
     }
 
     private boolean nodePatternMatch(FlirtNode node, byte[] b, int bufIndex, int bufSize) {
@@ -640,21 +683,18 @@ public class ApplyFlirt {
             return false;
         }
         int patternLength = bufIndex + node.length;
+        boolean matched = false;
         if (node.childList != null) {
             for (FlirtNode child : node.childList) {
-                if (nodeMatchBuffer(child, b, addr, bufSize, patternLength)) {
-                    return true;
-                }
+                matched |= nodeMatchBuffer(child, b, addr, bufSize, patternLength);
             }
         }
         if (node.moduleList != null) {
             for (FlirtModule module : node.moduleList) {
-                if (moduleMatchBuffer(module, b, addr, bufSize, patternLength)) {
-                    return true;
-                }
+                matched |= moduleMatchBuffer(module, b, addr, bufSize, patternLength);
             }
         }
-        return false;
+        return matched;
     }
 
     private long maximumMatchExtent(FlirtNode node, long patternLength) {
@@ -685,33 +725,19 @@ public class ApplyFlirt {
             throw new IOException("FLIRT match extent exceeds the supported 64 MiB buffer size");
         }
         byte[] buffer = new byte[(int) extent];
-        // A signature describes an object module, which can span several Ghidra functions.
-        // Read the bytes the signature actually checks, rather than using a function body's
-        // address count (which also gives the wrong length for disjoint bodies).
-        Set<Address> matched = new HashSet<>();
-        boolean progress;
-        do {
-            progress = false;
-            FunctionIterator functions = functionManager.getFunctions(true);
-            for (Function function : functions) {
-                monitor.checkCancelled();
-                if (matched.contains(function.getEntryPoint())) {
-                    continue;
-                }
-                try {
-                    matchingAddressSpace = function.getEntryPoint().getAddressSpace();
-                    int read = memory.getBytes(function.getEntryPoint(), buffer);
-                    if (nodeMatchBuffer(rootNode, buffer, function.getEntryPoint().getOffset(), read, 0)) {
-                        matched.add(function.getEntryPoint());
-                        progress = true;
-                    }
-                }
-                catch (MemoryAccessException | IllegalArgumentException e) {
-                    // Unreadable/uninitialized memory cannot establish a signature match.
-                }
+        // Modules can span several functions. Collect every candidate before renaming any.
+        FunctionIterator functions = functionManager.getFunctions(true);
+        for (Function function : functions) {
+            monitor.checkCancelled();
+            try {
+                matchingAddressSpace = function.getEntryPoint().getAddressSpace();
+                int read = memory.getBytes(function.getEntryPoint(), buffer);
+                nodeMatchBuffer(rootNode, buffer, function.getEntryPoint().getOffset(), read, 0);
             }
-            // A later callee match can enable a previously rejected referenced-function match.
-        } while (progress);
+            catch (MemoryAccessException | IllegalArgumentException e) {
+                // Unreadable memory cannot establish a signature match.
+            }
+        }
         return true;
     }
 
@@ -983,6 +1009,7 @@ public class ApplyFlirt {
         int version = header.version;
 
         name = headerInfo.getLibraryName();
+        libraryName = name;
 
         try {
             f.headerSize = f.b.available();

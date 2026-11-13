@@ -15,6 +15,10 @@
  */
 package siganalyzer.plugin;
 
+import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
+
 import docking.ActionContext;
 import docking.action.DockingAction;
 import docking.action.MenuData;
@@ -23,7 +27,12 @@ import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.plugin.ProgramPlugin;
 import ghidra.framework.plugintool.*;
 import ghidra.framework.plugintool.util.PluginStatus;
+import ghidra.program.model.listing.Program;
 import ghidra.util.HelpLocation;
+import ghidra.util.Swing;
+import ghidra.util.SystemUtilities;
+import siganalyzer.analyzer.FlirtAnalysisResults;
+import siganalyzer.analyzer.FlirtCandidate;
 
 /**
  * Provide class-level documentation that describes what this plugin does.
@@ -40,6 +49,10 @@ import ghidra.util.HelpLocation;
 public class SigAnalyzerPlugin extends ProgramPlugin {
 
 	SigAnalyzerProvider provider;
+	private final FlirtConflictsProvider conflictsProvider;
+	private final FlirtAnalysisResults.Listener resultsListener = this::resultsChanged;
+	private final Map<Program, List<FlirtCandidate>> seenReports = new WeakHashMap<>();
+	private boolean disposed;
 
 	/**
 	 * Plugin constructor.
@@ -52,6 +65,7 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 		// Customize provider (or remove if a provider is not desired)
 		String pluginName = getName();
 		provider = new SigAnalyzerProvider(this, pluginName);
+		conflictsProvider = new FlirtConflictsProvider(tool, pluginName);
 
 		// Customize help (or remove if help is not desired)
 		String topicName = "SigAnalyzer";
@@ -59,6 +73,7 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 		provider.setHelpLocation(new HelpLocation(topicName, anchorName));
 
 		createActions();
+		FlirtAnalysisResults.addListener(resultsListener);
 	}
 
 	@Override
@@ -79,6 +94,76 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 		openAction.setMenuBarData(
 			new MenuData(new String[] { "Tools", "SigAnalyzer", "Open SigAnalyzer" }, "SigAnalyzer"));
 		tool.addAction(openAction);
+
+		DockingAction conflictsAction = new DockingAction("FLIRT Conflicts", getName()) {
+			@Override
+			public void actionPerformed(ActionContext context) {
+				refreshConflicts(currentProgram, true);
+			}
+		};
+		conflictsAction.setMenuBarData(new MenuData(
+			new String[] { "Tools", "SigAnalyzer", "FLIRT Conflicts" }, "SigAnalyzer"));
+		conflictsAction.setHelpLocation(new HelpLocation("SigAnalyzer", "FlirtConflicts"));
+		tool.addAction(conflictsAction);
+	}
+
+	private void resultsChanged(Program program, List<FlirtCandidate> candidates) {
+		if (SystemUtilities.isInHeadlessMode()) {
+			return;
+		}
+		Swing.runLater(() -> {
+			if (!disposed && program == currentProgram && !program.isClosed()) {
+				refreshConflicts(program, !FlirtAnalysisResults.get(program).isEmpty());
+			}
+		});
+	}
+
+	private void refreshConflicts(Program program, boolean show) {
+		List<FlirtCandidate> candidates = program == null || program.isClosed() ?
+			List.of() : FlirtAnalysisResults.get(program);
+		conflictsProvider.setResults(program, candidates);
+		if (program != null) {
+			seenReports.put(program, candidates);
+		}
+		if (show) {
+			if (!conflictsProvider.isInTool()) {
+				tool.addComponentProvider(conflictsProvider, true);
+			}
+			conflictsProvider.setVisible(true);
+			conflictsProvider.toFront();
+		}
+	}
+
+	@Override
+	protected void programActivated(Program program) {
+		List<FlirtCandidate> candidates = FlirtAnalysisResults.get(program);
+		refreshConflicts(program, !candidates.isEmpty() && seenReports.get(program) != candidates);
+	}
+
+	@Override
+	protected void programDeactivated(Program program) {
+		conflictsProvider.setResults(null, List.of());
+	}
+
+	@Override
+	protected void programClosed(Program program) {
+		seenReports.remove(program);
+		if (program == currentProgram) {
+			conflictsProvider.setResults(null, List.of());
+		}
+		if (program.isClosed()) {
+			FlirtAnalysisResults.clear(program);
+		}
+	}
+
+	@Override
+	protected void dispose() {
+		disposed = true;
+		FlirtAnalysisResults.removeListener(resultsListener);
+		seenReports.clear();
+		conflictsProvider.dispose();
+		provider.dispose();
+		super.dispose();
 	}
 
 	private void showProvider() {

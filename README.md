@@ -37,6 +37,28 @@ points and user-defined names. Choose signatures for the program's processor,
 platform and ABI. Referenced-function constraints must be resolved before a
 module can match. SigAnalyzer does not discover or create missing functions.
 
+## Function ID and ambiguous matches
+
+SigAnalyzer runs after **Function ID** and before demanglers. Functions marked
+by Function ID are excluded, including FID conflicts and matches for which
+FID's analysis bookmarks were disabled. Identification uses FID bookmarks,
+plate comments and conflict labels, rather than treating every analysis name
+as a Function ID result.
+
+All enabled FLIRT signatures are checked before a name is applied. When a
+function has multiple distinct candidate names, its current name and comment
+are retained. The **FLIRT Conflicts** window opens after analysis and lists the
+address, current name, candidate name, signature file and library. Double-click
+a row or press Enter to navigate to the function. Reopen the latest report with
+**Tools → SigAnalyzer → FLIRT Conflicts**. The report is kept for the current
+Ghidra session and is replaced when analysis completes again.
+
+Several signatures that agree on the same name do not create a conflict.
+Unique matches get a function-entry plate comment with a **SigAnalyzer FLIRT**
+block listing the name and signature/library provenance. Existing comments are
+preserved, and running the analyzer again updates the block without duplicating it.
+Unresolved or ambiguous callee names cannot establish a referenced-function match.
+
 ## Build and test
 
 Install JDK 25 and extract the official
