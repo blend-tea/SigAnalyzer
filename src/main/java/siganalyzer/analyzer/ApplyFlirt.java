@@ -45,6 +45,7 @@ public class ApplyFlirt {
     Memory memory;
     Program program;
     File sigFile;
+    private final String signatureName;
     /** Set of entry point addresses excluded from rename targets */
     private Set<Address> entryPointAddresses;
     private TaskMonitor monitor = TaskMonitor.DUMMY;
@@ -55,8 +56,13 @@ public class ApplyFlirt {
     private AddressSpace matchingAddressSpace;
 
     public ApplyFlirt(Program program, File sigFile) {
+        this(program, sigFile, sigFile == null ? "" : sigFile.getName());
+    }
+
+    ApplyFlirt(Program program, File sigFile, String signatureName) {
         this.program = program;
         this.sigFile = sigFile;
+        this.signatureName = signatureName;
         this.functionManager = program.getFunctionManager();
         this.memory = program.getMemory();
     }
@@ -581,7 +587,7 @@ public class ApplyFlirt {
                 }
                 SymbolUtilities.validateName(publicFunction.name);
                 candidates.add(new FlirtCandidate(addr, publicFunction.name,
-                    sigFile.getName(), libraryName));
+                    signatureName, libraryName));
             }
             catch (IllegalArgumentException | AddressOutOfBoundsException | InvalidInputException e) {
                 // A bad export address must not prevent other exports being considered.

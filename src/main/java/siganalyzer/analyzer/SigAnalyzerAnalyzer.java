@@ -15,31 +15,15 @@
  */
 package siganalyzer.analyzer;
 
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
-
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import com.google.gson.JsonParseException;
+import java.nio.file.Path;
 
 import ghidra.app.services.AbstractAnalyzer;
 import ghidra.app.services.AnalysisPriority;
 import ghidra.app.services.AnalyzerType;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.framework.Application;
+import ghidra.framework.options.Options;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Program;
 import ghidra.util.exception.CancelledException;
@@ -47,6 +31,11 @@ import ghidra.util.task.TaskMonitor;
 
 /** Apply FLIRT after Function ID has had the first opportunity to identify functions. */
 public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
+    public static final String YARA_EXECUTABLE_OPTION = "YARA Executable";
+    public static final String YARA_TIMEOUT_OPTION = "YARA Timeout Seconds";
+    private String yaraExecutable = "yara";
+    private int yaraTimeoutSeconds = 30;
+
 
 	public SigAnalyzerAnalyzer() {
 
@@ -75,90 +64,42 @@ public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
 		return true;
 	}
 
-	@Override
-	public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log)
-			throws CancelledException {
-		String processorName = program.getLanguage().getProcessor().toString();
-		File sigDir = new File(Application.getUserSettingsDirectory(), "signatures/" + processorName);
-		if (!sigDir.isDirectory() && !sigDir.mkdirs()) {
-			log.appendMsg("SigAnalyzer", "Cannot create signature directory: " + sigDir);
-			return false;
-		}
-		Set<String> disabledFiles = loadDisabledFiles(sigDir);
-		File[] sigFiles = sigDir.listFiles(file -> file.isFile() &&
-			file.getName().toLowerCase(Locale.ROOT).endsWith(".sig"));
-		if (sigFiles == null) {
-			log.appendMsg("SigAnalyzer", "Cannot list signature directory: " + sigDir);
-			return false;
-		}
-		Arrays.sort(sigFiles, Comparator.comparing(File::getName));
-		List<File> signatures = new ArrayList<>();
-		for (File sigFile : sigFiles) {
-			if (!disabledFiles.contains(sigFile.getAbsolutePath())) {
-				signatures.add(sigFile);
-			}
-		}
-		FlirtAnalysisSession session = new FlirtAnalysisSession(program);
-		boolean success = session.run(signatures, monitor, log);
-		monitor.checkCancelled();
-		// Valid files can still produce a useful report when another file was invalid.
-		FlirtAnalysisResults.publish(program, session.getConflicts());
-		return success;
-	}
+    @Override
+    public void registerOptions(Options options, Program program) {
+        options.registerOption(YARA_EXECUTABLE_OPTION, "yara", null,
+            "Native YARA 4 executable name or full path. Required only for groups with rules.yar.");
+        options.registerOption(YARA_TIMEOUT_OPTION, 30, null,
+            "Maximum time in seconds for each signature group's YARA scan.");
+    }
 
-	/**
-	 * Loads the disabled files list from config.json
-	 * @param sigDir the signature directory
-	 * @return set of absolute paths of disabled files
-	 */
-	private Set<String> loadDisabledFiles(File sigDir) {
-		Set<String> disabledFiles = new HashSet<>();
-		File configFile = new File(sigDir, "config.json");
+    @Override
+    public void optionsChanged(Options options, Program program) {
+        yaraExecutable = options.getString(YARA_EXECUTABLE_OPTION, "yara");
+        yaraTimeoutSeconds = options.getInt(YARA_TIMEOUT_OPTION, 30);
+    }
 
-		// If config.json doesn't exist, create an empty one
-		if (!configFile.exists()) {
-			createEmptyConfig(configFile);
-			return disabledFiles;
-		}
-
-		// Read config.json
-		try (FileReader reader = new FileReader(configFile)) {
-			JsonElement jsonElement = JsonParser.parseReader(reader);
-			if (jsonElement.isJsonObject()) {
-				JsonObject jsonObject = jsonElement.getAsJsonObject();
-				if (jsonObject.has("Disable") && jsonObject.get("Disable").isJsonArray()) {
-					JsonArray disableArray = jsonObject.getAsJsonArray("Disable");
-					for (JsonElement element : disableArray) {
-						if (element.isJsonPrimitive() && element.getAsJsonPrimitive().isString()) {
-							disabledFiles.add(element.getAsString());
-						}
-					}
-				}
-			}
-		}
-		catch (IOException | JsonParseException e) {
-			// If reading fails, return empty set
-		}
-
-		return disabledFiles;
-	}
-
-	/**
-	 * Creates an empty config.json file
-	 * @param configFile the config file to create
-	 */
-	private void createEmptyConfig(File configFile) {
-		try {
-			JsonObject jsonObject = new JsonObject();
-			jsonObject.add("Disable", new JsonArray());
-			
-			Gson gson = new GsonBuilder().setPrettyPrinting().create();
-			try (FileWriter writer = new FileWriter(configFile)) {
-				gson.toJson(jsonObject, writer);
-			}
-		}
-		catch (IOException e) {
-			// If creation fails, silently ignore
-		}
-	}
+    @Override
+    public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log)
+            throws CancelledException {
+        String processorName = program.getLanguage().getProcessor().toString();
+        Path directory = Application.getUserSettingsDirectory().toPath()
+            .resolve("signatures").resolve(processorName);
+        try {
+            SignatureRepository repository = new SignatureRepository(directory);
+            SignatureSelection.Result selection = SignatureSelection.select(repository, program,
+                yaraExecutable, yaraTimeoutSeconds, monitor, log);
+            FlirtAnalysisSession session = new FlirtAnalysisSession(program);
+            boolean success = session.run(selection.signatures(), repository.root(), monitor, log);
+            monitor.checkCancelled();
+            // A failed gate skips only its own group. Publish useful results from other groups.
+            FlirtAnalysisResults.publish(program, session.getConflicts());
+            return selection.success() && success;
+        }
+        catch (IOException e) {
+            monitor.checkCancelled();
+            log.appendMsg("SigAnalyzer", "Cannot read signature repository: " + e.getMessage());
+            FlirtAnalysisResults.publish(program, java.util.List.of());
+            return false;
+        }
+    }
 }

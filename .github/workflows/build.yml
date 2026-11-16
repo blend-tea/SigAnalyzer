@@ -58,6 +58,11 @@ jobs:
         env:
           GHIDRA_INSTALL_DIR: ${{ runner.temp }}/ghidra/ghidra_12.2_PUBLIC
         run: ./gradlew --no-daemon clean test buildExtension
+      - name: Install native YARA for integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes yara
+          yara --version
       - name: Test packaged extension in headless Ghidra
         env:
           GHIDRA_INSTALL_DIR: ${{ runner.temp }}/ghidra/ghidra_12.2_PUBLIC

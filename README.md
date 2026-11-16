@@ -1,6 +1,8 @@
 [日本語版README](README_ja.md)
 # SigAnalyzer
-A Ghidra plugin that applies IDA's FLIRT signatures to Ghidra.
+A Ghidra extension that identifies existing functions with IDA FLIRT signatures,
+preserves Function ID results, and records signature provenance. It supports
+directory groups with optional YARA conditions and manual conflict resolution.
 
 ## Installation
 
@@ -22,9 +24,12 @@ A menu is added under **Tools** where you can add/remove signatures and choose w
 
 Select **Tools → SigAnalyzer → Open SigAnalyzer**.
 
-![SigAnalyzer Menu](./images/Menu.png)
+![Signature manager with directory groups and optional YARA rules](./images/SignatureGroups.png)
 
-From here you can add or remove FLIRT signatures.
+Choose **(default)** or create a directory with **New group...**, then use
+**Add signatures...**. Select existing rows and use **Move selected...** to put
+them in another group. The Enabled column and bulk buttons control which files
+are considered during analysis.
 
 ## Added FLIRT Signatures
 A new `signatures` folder is created under GhidraUserSettingsDir. Directories are created per processor name, and `.sig` files are copied there. Excluded files are listed in `config.json`.
@@ -53,11 +58,72 @@ a row or press Enter to navigate to the function. Reopen the latest report with
 **Tools → SigAnalyzer → FLIRT Conflicts**. The report is kept for the current
 Ghidra session and is replaced when analysis completes again.
 
+Right-click a candidate and choose **Apply FLIRT Candidate** to apply that
+specific name. This explicit choice uses a user-defined name and retains the
+selected name's signature provenance. It supports Ghidra Undo/Redo. Function ID
+results, imported names and entry points remain protected. Finish running
+analysis before applying a choice.
+
+![FLIRT conflicts and the Apply FLIRT Candidate context menu](./images/FlirtConflicts.png)
+
 Several signatures that agree on the same name do not create a conflict.
 Unique matches get a function-entry plate comment with a **SigAnalyzer FLIRT**
 block listing the name and signature/library provenance. Existing comments are
 preserved, and running the analyzer again updates the block without duplicating it.
 Unresolved or ambiguous callee names cannot establish a referenced-function match.
+
+## Signature groups and optional YARA rules
+
+The signature manager groups `.sig` files by directory under the current
+processor's signature folder. Select a group, create one with **New group...**,
+add signatures, or use **Move selected...** to reorganize existing files.
+Existing signatures in the processor folder remain in **(default)**. Moving a
+signature preserves its enabled state; nested group names are supported.
+
+Each group can have an optional **rules.yar**, created with **Edit rule...** or
+loaded with **Import rule...**. A group with this file is analyzed only when at
+least one rule matches the original imported binary stored by Ghidra. The rule
+applies to `.sig` files directly in that directory; it does not apply to child
+directories. A group without a rule is analyzed normally. **Remove rule** makes
+the selected group ungated again. Changes invalidate old conflict reports;
+run SigAnalyzer again to update the results.
+
+![Editing the selected group's optional rules.yar](./images/YaraRuleEditor.png)
+
+```text
+signatures/x86/
+  legacy.sig                 # (default), no YARA gate
+  openssl/
+    rules.yar                # only controls openssl/crypto.sig
+    crypto.sig
+    other/
+      extra.sig              # separate group, no inherited gate
+```
+
+Example `rules.yar`:
+
+```yara
+rule openssl_binary {
+    strings:
+        $marker = "OpenSSL" ascii
+    condition:
+        $marker
+}
+```
+
+YARA gating requires a native **YARA 4** executable. Install `yara` (for example,
+`apt install yara` on Debian/Ubuntu or `brew install yara` on macOS), or configure
+the executable's full path in **SigAnalyzer → YARA Executable** in the analysis
+options. On Windows, use the path to the downloaded YARA executable. Enter a
+single executable path without command-line arguments. **YARA Timeout Seconds**
+defaults to 30 per group. Groups without rules do not require YARA.
+
+The gate uses original `FileBytes`, even when the original file is no longer
+on disk; patched program memory is not the scan target. If several imports are
+stored, the executable filename is preferred, then the program name, then the
+first stored import. Relative YARA includes can refer to files in the group
+directory. A missing engine, invalid rule, timeout or unavailable original bytes
+skips the affected group and writes an analysis-log message. Other groups still run.
 
 ## Build and test
 
@@ -76,6 +142,8 @@ src/test/run-headless.sh
 The installable extension is written to `dist/`; JUnit results are in
 `build/reports/tests/test/`. The headless test temporarily installs the built ZIP
 and restores any existing SigAnalyzer extension afterwards.
+The headless regression suite requires native `yara` on PATH, or its executable
+path in `SIGANALYZER_TEST_YARA`, to exercise the optional YARA integration.
 See [the FLIRT implementation review](docs/FLIRT_REVIEW.md)
 for format references and regression coverage.
 

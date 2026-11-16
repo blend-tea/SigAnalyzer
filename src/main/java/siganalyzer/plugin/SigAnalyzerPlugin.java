@@ -127,7 +127,7 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 		}
 		if (show) {
 			if (!conflictsProvider.isInTool()) {
-				tool.addComponentProvider(conflictsProvider, true);
+				conflictsProvider.addToTool();
 			}
 			conflictsProvider.setVisible(true);
 			conflictsProvider.toFront();
@@ -136,17 +136,20 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 
 	@Override
 	protected void programActivated(Program program) {
+		refreshSignatureManager();
 		List<FlirtCandidate> candidates = FlirtAnalysisResults.get(program);
 		refreshConflicts(program, !candidates.isEmpty() && seenReports.get(program) != candidates);
 	}
 
 	@Override
 	protected void programDeactivated(Program program) {
+		refreshSignatureManager();
 		conflictsProvider.setResults(null, List.of());
 	}
 
 	@Override
 	protected void programClosed(Program program) {
+		refreshSignatureManager();
 		seenReports.remove(program);
 		if (program == currentProgram) {
 			conflictsProvider.setResults(null, List.of());
@@ -172,5 +175,13 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 		}
 		provider.activateProvider();
 		provider.toFront();
+	}
+
+	private void refreshSignatureManager() {
+		Swing.runLater(() -> {
+			if (!disposed && provider.isVisible()) {
+				provider.refresh();
+			}
+		});
 	}
 }

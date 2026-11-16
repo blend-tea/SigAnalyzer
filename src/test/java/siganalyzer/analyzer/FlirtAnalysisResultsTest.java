@@ -22,6 +22,7 @@ public class FlirtAnalysisResultsTest {
                     case "hashCode": return System.identityHashCode(proxy);
                     case "equals": return proxy == arguments[0];
                     case "toString": return "synthetic program";
+                    case "isClosed": return false;
                     default: return null;
                 }
             });

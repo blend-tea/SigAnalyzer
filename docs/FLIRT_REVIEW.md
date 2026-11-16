@@ -1,6 +1,6 @@
 # FLIRT implementation review
 
-Reviewed for SigAnalyzer 0.2.0 and extended in 0.3.0 against these implementations:
+Reviewed for SigAnalyzer 0.2.0 and extended in 0.3.0/0.4.0 against these implementations:
 
 - [angr FLIRT parser](https://github.com/angr/angr/blob/8d4cbc652db70a6444a40b90c47326193c10d81b/angr/analyses/flirt/flirt_sig.py)
   and [matcher](https://github.com/angr/angr/blob/8d4cbc652db70a6444a40b90c47326193c10d81b/angr/analyses/flirt/flirt_matcher.py).
@@ -26,6 +26,9 @@ proprietary signature files are included in the regression suite.
 | Function ID | Run at priority 800, after FID (799). Protect FID analysis bookmarks, its single/multiple-match plate comments and conflict labels, including when bookmark creation is disabled. |
 | Multiple candidates | Collect every matching module and trie branch across all enabled files before mutation. Prune impossible reference dependencies; apply only globally unique names supported by resolved callees. Report different names without renaming. |
 | Provenance | Append/update a delimited FLIRT plate-comment block with all agreeing signature sources, preserving unrelated comments. |
+| Manual resolution | An explicitly selected current conflict candidate is applied in an undoable transaction as a user-defined name. Re-check Function ID, imported-name and entry-point protection before mutation; remove report rows only after commit. |
+| Directory gates | Discover signatures per directory, preserving the legacy root group and disabled-file settings. An optional rules.yar controls only direct signatures, and native YARA errors skip that group without falling back to unfiltered signatures. |
+| YARA target | Extract the original imported FileBytes once per analysis session. Use native count mode with a deadline and cancellation, rather than matching arbitrary stdout or scanning patched memory. |
 
 The analyzer operates on functions already discovered by Ghidra. It does not
 create functions, infer missing reference targets, or relax byte comparisons.

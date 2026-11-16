@@ -1,5 +1,6 @@
 # SigAnalyzer
-IDAのFLIRTシグネチャをGhidraに適応するPlugin
+IDA FLIRT シグネチャで Ghidra の既存関数を識別し、名前と署名の出典を記録する拡張です。
+Function ID の結果を保持し、ディレクトリごとの YARA 条件と、複数候補の手動適用に対応します。
 
 ## インストール
 
@@ -9,9 +10,9 @@ Ghidra のプロジェクト画面で **File → Install Extensions** からイ�
 メニューが表示されない場合は CodeBrowser のプラグイン設定で **SigAnalyzerPlugin** を有効にします。
 拡張 ZIP はビルド対象の Ghidra バージョン専用です。
 
-AnalyzerにSigAnalyzerが追加される。
+解析器に SigAnalyzer が追加されます。
 
-Toolsに追加されるメニューでsigの追加・削除、Analyzerから除外するファイルの選択ができる。
+Tools のメニューから署名の追加・削除・グループ分けと、解析対象ファイルの選択ができます。
 
 ## 使い方
 
@@ -21,9 +22,11 @@ Toolsに追加されるメニューでsigの追加・削除、Analyzerから除�
 
 Tools -> SigAnalyzer -> Open SigAnalyzer を選択する。
 
-![SigAnalyzer Menu](./images/Menu.png)
+![ディレクトリ別の署名管理と任意の YARA ルール](./images/SignatureGroups.png)
 
-ここからFLIRTシグネチャの追加・削除ができる。
+**(default)** を選ぶか **New group...** でディレクトリを作成し、**Add signatures...** から署名を追加します。
+登録済みの署名を選んで **Move selected...** から別グループへ移動できます。
+Enabled 列と一括切り替えボタンで、解析対象にするファイルを選択します。
 
 ## 追加したFLIRTシグネチャ
 GhidraUserSettingsDirに新しくsignaturesが生成され、processorNameごとのDirectoryが生成され、ここに.sigファイルがコピーされる。
@@ -52,10 +55,66 @@ FID の複数候補も保護し、FID の解析ブックマークを無効にし
 **Tools → SigAnalyzer → FLIRT Conflicts** から再表示でき、結果は Ghidra の現在のセッション内で保持します。
 再解析の完了時に一覧を更新します。
 
+候補の行を右クリックして **Apply FLIRT Candidate** を選ぶと、その名前を適用します。
+明示的に選んだ名前はユーザー定義名として保持し、選択した名前の署名情報をコメントに記録します。
+Ghidra の Undo/Redo に対応します。FID の結果・インポート名・エントリーポイントは引き続き保護します。
+解析が実行中の場合は、終了してから適用してください。
+
+![FLIRT の複数候補と右クリックの適用メニュー](./images/FlirtConflicts.png)
+
 複数の署名が同じ名前を示す場合は競合として扱いません。
 一意に識別した関数の先頭には、名前・署名ファイル・ライブラリを記録した **SigAnalyzer FLIRT** コメントを追加します。
 既存のコメントを保持し、再実行時は専用ブロックを更新して重複を防ぎます。
 未解決または複数候補の呼び出し先を、参照先一致の根拠には使用しません。
+
+## 署名グループと任意の YARA ルール
+
+署名管理画面でディレクトリごとのグループを選択できます。
+**New group...** で作成し、署名を追加するか **Move selected...** で登録済みの署名を移動します。
+従来のプロセッサフォルダー直下の署名は **(default)** グループとして使えます。
+移動時に有効／無効の状態を保持し、入れ子のグループ名にも対応します。
+
+各グループに **rules.yar** を任意で作成できます。
+**Edit rule...** で編集するか **Import rule...** で取り込みます。
+ルールがあるグループは、Ghidra が保存している元バイナリに少なくとも 1 つのルールが一致した場合だけ解析します。
+対象は同じディレクトリ直下の `.sig` のみで、子ディレクトリには継承しません。
+ルールがないグループは通常どおり解析し、**Remove rule** で条件を解除できます。
+設定変更時は古い Conflict 一覧を無効化するため、SigAnalyzer を再実行してください。
+
+![選択グループの rules.yar を編集](./images/YaraRuleEditor.png)
+
+```text
+signatures/x86/
+  legacy.sig                 # (default): 条件なし
+  openssl/
+    rules.yar                # openssl/crypto.sig だけの条件
+    crypto.sig
+    other/
+      extra.sig              # 別グループ: 親の条件は継承しない
+```
+
+`rules.yar` の例:
+
+```yara
+rule openssl_binary {
+    strings:
+        $marker = "OpenSSL" ascii
+    condition:
+        $marker
+}
+```
+
+YARA 条件を使うグループには、ネイティブの **YARA 4** 実行ファイルが必要です。
+Debian/Ubuntu では `apt install yara`、macOS では `brew install yara` などで導入します。
+Windows などで実行ファイルを直接指定する場合は、解析オプションの
+**SigAnalyzer → YARA Executable** にフルパスを設定してください。コマンド引数は含めません。
+**YARA Timeout Seconds** の初期値はグループごとに 30 秒です。
+ルールがないグループでは YARA の導入は不要です。
+
+照合には Ghidra が保持する元の `FileBytes` を使用するため、元ファイルがディスク上になくても動作します。
+パッチ後のプログラムメモリは照合しません。複数のインポートがある場合は、実行ファイル名、プログラム名、最初のインポートの順で選択します。
+相対パスの YARA include はグループディレクトリ内のファイルを参照できます。
+エンジン不在・構文エラー・タイムアウト・元バイト不在の場合は、そのグループだけを除外して解析ログに理由を表示します。
 
 ## ビルドとテスト
 
@@ -73,6 +132,7 @@ src/test/run-headless.sh
 
 インストール用 ZIP は `dist/`、JUnit の結果は `build/reports/tests/test/` に生成されます。
 headless テストは生成した ZIP を一時導入し、既存の SigAnalyzer 拡張があれば終了時に復元します。
+YARA 連携も検証するため、headless テストには PATH 上の `yara`、または環境変数 `SIGANALYZER_TEST_YARA` に実行ファイルのパスを設定する必要があります。
 FLIRT の比較対象と回帰テストの詳細は [実装レビュー](docs/FLIRT_REVIEW.md) を参照してください。
 
 ## CI / Release

@@ -3,6 +3,7 @@
 // @category SigAnalyzer.Tests
 
 import java.io.ByteArrayOutputStream;
+import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -13,6 +14,7 @@ import java.util.stream.Collectors;
 
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.importer.MessageLog;
+import ghidra.program.database.ProgramDB;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.BookmarkType;
@@ -20,7 +22,15 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.symbol.SourceType;
 import siganalyzer.analyzer.ApplyFlirt;
 import siganalyzer.analyzer.FlirtAnalysisSession;
+import siganalyzer.analyzer.FlirtAnalysisResults;
 import siganalyzer.analyzer.FlirtCandidate;
+import siganalyzer.analyzer.FlirtConflictResolution;
+import siganalyzer.analyzer.YaraSignatureGate;
+import siganalyzer.analyzer.SignatureRepository;
+import siganalyzer.analyzer.SignatureSelection;
+import ghidra.util.exception.CancelledException;
+import ghidra.util.exception.InvalidInputException;
+import ghidra.util.task.TaskMonitorAdapter;
 
 public class SigAnalyzerSmokeTest extends GhidraScript {
     private static final byte[] CRC_VECTOR = "123456789".getBytes(StandardCharsets.US_ASCII);
@@ -44,6 +54,13 @@ public class SigAnalyzerSmokeTest extends GhidraScript {
         testStaleAnalysisNameDoesNotResolveAmbiguousCallee();
         testInvalidCandidateNameCannotResolveCaller();
         testCommentExcludesUnresolvedDuplicateSource();
+        testManualConflictChoiceAndUndo();
+        testManualConflictGuardsAndRollback();
+        testNativeYaraRules();
+        testYaraFailureTimeoutAndCancellation();
+        testGroupedSignatureSelection();
+        testGroupedSignatureProvenance();
+        testClosingProgramClearsOverlayReport();
         println("SIGANALYZER_SMOKE_TEST_PASSED");
     }
 
@@ -388,6 +405,421 @@ public class SigAnalyzerSmokeTest extends GhidraScript {
             "unresolved duplicate source is excluded from success provenance");
         check(namesAt(session, callee).equals(Set.of("ambiguous_support_a", "ambiguous_support_b")),
             "supporting callee remains ambiguous");
+    }
+
+    private ProgramDB independentProgram(String name) throws Exception {
+        ProgramDB program = new ProgramDB(name, currentProgram.getLanguage(),
+            currentProgram.getLanguage().getCompilerSpecByID(
+                currentProgram.getCompilerSpec().getCompilerSpecID()), this);
+        int transaction = program.startTransaction("Initialize manual-choice fixture");
+        boolean commit = false;
+        try {
+            Address start = program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000);
+            program.getMemory().createInitializedBlock("manual", start, 0x100, (byte) 0x90,
+                monitor, false);
+            program.getFunctionManager().createFunction("original_user_name", start,
+                new AddressSet(start, start.add(31)), SourceType.USER_DEFINED);
+            Address second = start.add(0x40);
+            program.getFunctionManager().createFunction(null, second,
+                new AddressSet(second, second.add(31)), SourceType.DEFAULT);
+            commit = true;
+        }
+        finally {
+            program.endTransaction(transaction, commit);
+        }
+        return program;
+    }
+
+    private void testClosingProgramClearsOverlayReport() throws Exception {
+        ProgramDB program = independentProgram("closed-overlay-report");
+        boolean released = false;
+        try {
+            int transaction = program.startTransaction("Create overlay conflict fixture");
+            Address overlay;
+            try {
+                Address base = program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000);
+                overlay = program.getMemory().createInitializedBlock("close_overlay", base,
+                    32, (byte) 0x90, monitor, true).getStart();
+                program.getFunctionManager().createFunction(null, overlay,
+                    new AddressSet(overlay, overlay.add(31)), SourceType.DEFAULT);
+            }
+            finally {
+                program.endTransaction(transaction, true);
+            }
+            FlirtAnalysisResults.publish(program, List.of(
+                new FlirtCandidate(overlay, "overlay_a", "a.sig", ""),
+                new FlirtCandidate(overlay, "overlay_b", "b.sig", "")));
+            check(FlirtAnalysisResults.get(program).size() == 2, "overlay conflict report is cached while open");
+            program.release(this);
+            released = true;
+            check(program.isClosed(), "independent overlay program has closed");
+            check(FlirtAnalysisResults.get(program).isEmpty(),
+                "closing a program clears its cached overlay candidates without manual cleanup");
+        }
+        finally {
+            if (!released) {
+                program.release(this);
+            }
+        }
+    }
+
+    private void testManualConflictChoiceAndUndo() throws Exception {
+        ProgramDB program = independentProgram("manual-success");
+        try {
+            Address entry = program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000);
+            Address other = entry.add(0x40);
+            int setup = program.startTransaction("Keep an existing analyst comment");
+            program.getFunctionManager().getFunctionAt(entry).setComment("Manual analyst comment.");
+            program.endTransaction(setup, true);
+            FlirtCandidate selected = new FlirtCandidate(entry, "chosen_name", "chosen-one.sig", "first library");
+            FlirtCandidate duplicate = new FlirtCandidate(entry, "chosen_name", "chosen-two.sig", "second library");
+            FlirtCandidate alternative = new FlirtCandidate(entry, "other_name", "alternative.sig", "other library");
+            List<FlirtCandidate> unrelated = List.of(
+                new FlirtCandidate(other, "unrelated_a", "a.sig", ""),
+                new FlirtCandidate(other, "unrelated_b", "b.sig", ""));
+            FlirtAnalysisResults.publish(program, List.of(selected, duplicate, alternative,
+                unrelated.get(0), unrelated.get(1)));
+            check(FlirtConflictResolution.canApply(program, selected), "current candidate is applicable while idle");
+            List<FlirtCandidate> remaining = FlirtConflictResolution.apply(program, selected);
+            Function function = program.getFunctionManager().getFunctionAt(entry);
+            check("chosen_name".equals(function.getName()), "explicit choice replaces an ordinary user-defined name");
+            check(function.getSymbol().getSource() == SourceType.USER_DEFINED,
+                "explicit choice is protected as a user-defined name");
+            check(function.getComment().contains("Manual analyst comment."), "manual choice preserves analyst comment");
+            check(function.getComment().contains("chosen-one.sig") && function.getComment().contains("chosen-two.sig"),
+                "manual choice records all sources of the selected name");
+            check(!function.getComment().contains("alternative.sig"), "unselected candidate is not success provenance");
+            check(remaining.equals(unrelated) && FlirtAnalysisResults.get(program).equals(unrelated),
+                "applying a choice removes every alternative only at that address");
+            check(program.getCurrentTransactionInfo() == null, "manual choice closes its transaction");
+            check(program.canUndo(), "manual choice is undoable in Ghidra");
+            program.undo();
+            flushProgramEvents(program);
+            Function undone = program.getFunctionManager().getFunctionAt(entry);
+            check("original_user_name".equals(undone.getName()), "one undo restores the previous name");
+            check("Manual analyst comment.".equals(undone.getComment()), "one undo restores the previous comment");
+            check(Set.copyOf(FlirtAnalysisResults.get(program)).equals(Set.of(selected, duplicate,
+                alternative, unrelated.get(0), unrelated.get(1))), "undo restores every conflict row at the chosen address");
+            check(program.canRedo(), "manual choice remains redoable after report restoration");
+            program.redo();
+            flushProgramEvents(program);
+            check("chosen_name".equals(program.getFunctionManager().getFunctionAt(entry).getName()),
+                "redo reapplies the chosen name");
+            check(Set.copyOf(FlirtAnalysisResults.get(program)).equals(Set.copyOf(unrelated)),
+                "redo hides resolved conflict alternatives again");
+        }
+        finally {
+            FlirtAnalysisResults.clear(program);
+            program.release(this);
+        }
+    }
+
+    private void testManualConflictGuardsAndRollback() throws Exception {
+        ProgramDB program = independentProgram("manual-guards");
+        try {
+            Address entry = program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000);
+            Function function = program.getFunctionManager().getFunctionAt(entry);
+            FlirtCandidate selected = new FlirtCandidate(entry, "selected", "selected.sig", "");
+            FlirtCandidate alternative = new FlirtCandidate(entry, "alternative", "alternative.sig", "");
+            FlirtAnalysisResults.publish(program, List.of(alternative));
+            check(!FlirtConflictResolution.canApply(program, selected), "stale candidate disabled");
+            expectManualRejection(program, selected);
+            check("original_user_name".equals(function.getName()), "stale candidate cannot rename a function");
+
+            FlirtAnalysisResults.publish(program, List.of(selected, alternative));
+            int transaction = program.startTransaction("Program is busy");
+            try {
+                function.setComment("Outer transaction retained.");
+                check(!FlirtConflictResolution.canApply(program, selected), "candidate disabled while program is busy");
+                expectManualRejection(program, selected);
+                check(program.getCurrentTransactionInfo() != null, "rejection leaves the caller's transaction open");
+            }
+            finally {
+                program.endTransaction(transaction, true);
+            }
+            check("Outer transaction retained.".equals(function.getComment()), "busy rejection does not abort another transaction");
+
+            for (int protection = 0; protection < 3; protection++) {
+                transaction = program.startTransaction("Protect candidate function");
+                String protectedName = "protected_name_" + protection;
+                try {
+                    function.setComment(protection == 0 ? "Library Function - Single Match\nFID library" : null);
+                    function.setName(protectedName, protection == 1 ? SourceType.IMPORTED : SourceType.USER_DEFINED);
+                    if (protection == 2) {
+                        program.getSymbolTable().addExternalEntryPoint(entry);
+                    }
+                }
+                finally {
+                    program.endTransaction(transaction, true);
+                }
+                check(!FlirtConflictResolution.canApply(program, selected), "protected candidate disabled: " + protection);
+                expectManualRejection(program, selected);
+                check(protectedName.equals(function.getName()), "protected name retained: " + protection);
+                check(FlirtAnalysisResults.get(program).size() == 2, "protected rejection preserves conflict rows");
+            }
+
+            transaction = program.startTransaction("Remove guards before rename failure");
+            function.setName("original_user_name", SourceType.USER_DEFINED);
+            function.setComment("Retain on failure.");
+            program.getSymbolTable().removeExternalEntryPoint(entry);
+            program.endTransaction(transaction, true);
+            FlirtCandidate invalid = new FlirtCandidate(entry, "invalid chosen name", "invalid.sig", "");
+            List<FlirtCandidate> before = List.of(invalid, alternative);
+            FlirtAnalysisResults.publish(program, before);
+            try {
+                FlirtConflictResolution.apply(program, invalid);
+                throw new AssertionError("invalid manual name must fail");
+            }
+            catch (InvalidInputException expected) {
+                check("original_user_name".equals(function.getName()), "failed rename rolls back the name");
+                check("Retain on failure.".equals(function.getComment()), "failed rename rolls back the comment");
+                check(FlirtAnalysisResults.get(program).equals(before), "failed rename retains conflict report");
+                check(program.getCurrentTransactionInfo() == null, "failed rename closes its transaction");
+            }
+        }
+        finally {
+            FlirtAnalysisResults.clear(program);
+            program.release(this);
+        }
+    }
+
+    private static void expectManualRejection(ProgramDB program, FlirtCandidate candidate) throws Exception {
+        try {
+            FlirtConflictResolution.apply(program, candidate);
+            throw new AssertionError("inapplicable candidate must be rejected at the mutation boundary");
+        }
+        catch (IllegalArgumentException | IllegalStateException expected) {
+            // The user may leave a menu open while analysis or another tool updates the program.
+        }
+    }
+
+    private static void flushProgramEvents(ProgramDB program) throws Exception {
+        program.flushEvents();
+        javax.swing.SwingUtilities.invokeAndWait(() -> { });
+    }
+
+    private static String nativeYara() {
+        return System.getenv().getOrDefault("SIGANALYZER_TEST_YARA", "yara");
+    }
+
+    private void testNativeYaraRules() throws Exception {
+        Path directory = Files.createTempDirectory("siganalyzer-native-yara-");
+        byte original = currentProgram.getMemory().getByte(toAddr(0));
+        try {
+            // The imported fixture is C3, but mapped memory is now CC. YARA must scan FileBytes.
+            currentProgram.getMemory().setByte(toAddr(0), (byte) 0xcc);
+            Path matching = Files.writeString(directory.resolve("matching.yar"),
+                "rule original_byte { strings: $ret = { C3 } condition: filesize == 1 and $ret at 0 }");
+            Path nonmatching = Files.writeString(directory.resolve("nonmatching.yar"),
+                "rule mapped_byte { strings: $trap = { CC } condition: $trap at 0 }");
+            Path logging = Files.writeString(directory.resolve("logging.yar"),
+                "import \"console\"\nrule logs_without_match { condition: console.log(\"1\") and false }");
+            Files.writeString(directory.resolve("included.yar"), "rule included_rule { condition: filesize == 1 }");
+            Path including = Files.writeString(directory.resolve("including.yar"), "include \"included.yar\"");
+            try (YaraSignatureGate gate = new YaraSignatureGate(currentProgram, nativeYara(), 10)) {
+                check(gate.matches(matching, monitor), "native YARA matches original imported bytes");
+                check(!gate.matches(nonmatching, monitor), "native YARA ignores modified mapped bytes");
+                check(!gate.matches(logging, monitor), "console.log output cannot masquerade as a YARA match");
+                check(gate.matches(including, monitor), "relative includes resolve in the rule group directory");
+            }
+            Path malformed = Files.writeString(directory.resolve("malformed.yar"), "rule broken { condition: }");
+            try (YaraSignatureGate gate = new YaraSignatureGate(currentProgram, nativeYara(), 10)) {
+                expectYaraFailure(gate, malformed, "invalid native YARA syntax must be an error");
+            }
+            try (YaraSignatureGate gate = new YaraSignatureGate(currentProgram,
+                    directory.resolve("missing-yara-executable").toString(), 10)) {
+                expectYaraFailure(gate, matching, "missing YARA executable must be an error");
+            }
+            ProgramDB noFileBytes = independentProgram("yara-no-file-bytes");
+            try (YaraSignatureGate gate = new YaraSignatureGate(noFileBytes, nativeYara(), 10)) {
+                expectYaraFailure(gate, matching, "missing original FileBytes must be an error");
+            }
+            finally {
+                noFileBytes.release(this);
+            }
+            ProgramDB multipleImports = independentProgram("a.exe");
+            try {
+                int transaction = multipleImports.startTransaction("Store imports with identical basenames");
+                try {
+                    multipleImports.getMemory().createFileBytes("/other/a.exe", 0, 1,
+                        new ByteArrayInputStream(new byte[] {0x11}), monitor);
+                    multipleImports.getMemory().createFileBytes("/main/a.exe", 0, 1,
+                        new ByteArrayInputStream(new byte[] {0x22}), monitor);
+                    multipleImports.setExecutablePath("/main/a.exe");
+                }
+                finally {
+                    multipleImports.endTransaction(transaction, true);
+                }
+                Path exactSource = Files.writeString(directory.resolve("exact-source.yar"),
+                    "rule exact_executable_store { condition: filesize == 1 and uint8(0) == 0x22 }");
+                try (YaraSignatureGate gate = new YaraSignatureGate(multipleImports, nativeYara(), 10)) {
+                    check(gate.matches(exactSource, monitor),
+                        "exact executable path wins over an earlier imported file with the same basename");
+                }
+            }
+            finally {
+                multipleImports.release(this);
+            }
+        }
+        finally {
+            currentProgram.getMemory().setByte(toAddr(0), original);
+            removeTemporaryDirectory(directory);
+        }
+    }
+
+    private void testYaraFailureTimeoutAndCancellation() throws Exception {
+        Path directory = Files.createTempDirectory("siganalyzer-yara-process-");
+        try {
+            Path rule = Files.writeString(directory.resolve("rules.yar"), "rule test { condition: true }");
+            Path sleeper = Files.writeString(directory.resolve("slow-yara"), "#!/bin/sh\nexec sleep 10\n");
+            check(sleeper.toFile().setExecutable(true), "slow YARA test executable created");
+            long started = System.nanoTime();
+            try (YaraSignatureGate gate = new YaraSignatureGate(currentProgram, sleeper.toString(), 1)) {
+                expectYaraFailure(gate, rule, "unresponsive YARA process must time out");
+            }
+            check(System.nanoTime() - started < 5_000_000_000L, "YARA timeout does not wait for the slow process");
+
+            TaskMonitorAdapter cancellable = new TaskMonitorAdapter(true);
+            Thread cancel = new Thread(() -> {
+                try {
+                    Thread.sleep(200);
+                    cancellable.cancel();
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            cancel.start();
+            started = System.nanoTime();
+            try (YaraSignatureGate gate = new YaraSignatureGate(currentProgram, sleeper.toString(), 10)) {
+                try {
+                    gate.matches(rule, cancellable);
+                    throw new AssertionError("cancellation must interrupt a running YARA process");
+                }
+                catch (CancelledException expected) {
+                    check(System.nanoTime() - started < 5_000_000_000L, "YARA cancellation returns promptly");
+                }
+            }
+            finally {
+                cancel.join(1000);
+            }
+
+            Path targetRecord = directory.resolve("target-path.txt");
+            Path recorder = Files.writeString(directory.resolve("recording-yara"),
+                "#!/bin/sh\nfor target_path in \"$@\"; do :; done\nprintf '%s\\n' \"$target_path\" > '" +
+                    targetRecord + "'\nprintf '0\\n'\n");
+            check(recorder.toFile().setExecutable(true), "YARA target recorder created");
+            Path target;
+            try (YaraSignatureGate gate = new YaraSignatureGate(currentProgram, recorder.toString(), 5)) {
+                check(!gate.matches(rule, monitor), "valid native count zero means no match");
+                target = Path.of(Files.readString(targetRecord).strip());
+                check(Files.isRegularFile(target), "original-file temporary target exists during gate use");
+            }
+            check(!Files.exists(target), "gate close removes the original-file temporary target");
+        }
+        finally {
+            removeTemporaryDirectory(directory);
+        }
+    }
+
+    private void expectYaraFailure(YaraSignatureGate gate, Path rule, String message) throws Exception {
+        try {
+            gate.matches(rule, monitor);
+            throw new AssertionError(message);
+        }
+        catch (java.io.IOException expected) {
+            check(expected.getMessage() != null && !expected.getMessage().isBlank(), "YARA failure has diagnostic text");
+        }
+    }
+
+    private void testGroupedSignatureSelection() throws Exception {
+        Path root = Files.createTempDirectory("siganalyzer-group-selection-");
+        try {
+            SignatureRepository repository = new SignatureRepository(root);
+            Path plain = Files.write(root.resolve("plain.sig"), new byte[] {1});
+            Path matchingDirectory = repository.createGroup("matching").directory();
+            Path matching = Files.write(matchingDirectory.resolve("matching.sig"), new byte[] {2});
+            Files.writeString(matchingDirectory.resolve(SignatureRepository.RULE_FILE),
+                "rule original_fixture { condition: filesize == 1 and uint8(0) == 0xc3 }");
+            Path parentDirectory = repository.createGroup("not-matching").directory();
+            Path skipped = Files.write(parentDirectory.resolve("skipped.sig"), new byte[] {3});
+            Files.writeString(parentDirectory.resolve(SignatureRepository.RULE_FILE),
+                "rule does_not_match { condition: false }");
+            Path childDirectory = repository.createGroup("not-matching/child").directory();
+            Path child = Files.write(childDirectory.resolve("child.sig"), new byte[] {4});
+            Path invalidDirectory = repository.createGroup("invalid-rule").directory();
+            Path invalid = Files.write(invalidDirectory.resolve("invalid.sig"), new byte[] {5});
+            Files.writeString(invalidDirectory.resolve(SignatureRepository.RULE_FILE),
+                "rule invalid { condition: }");
+            MessageLog log = new MessageLog();
+            SignatureSelection.Result result = SignatureSelection.select(repository, currentProgram,
+                nativeYara(), 10, monitor, log);
+            Set<Path> selected = result.signatures().stream().map(java.io.File::toPath)
+                .collect(Collectors.toSet());
+            check(selected.equals(Set.of(plain, matching, child)),
+                "only matched groups and unconditional direct groups are selected");
+            check(!selected.contains(skipped) && !selected.contains(invalid),
+                "nonmatching and invalid rule groups are skipped");
+            check(!result.success(), "invalid rule is reported as an error for its group");
+            repository.setEnabled(invalid, false);
+            result = SignatureSelection.select(repository, currentProgram, nativeYara(), 10,
+                monitor, new MessageLog());
+            check(result.success(), "ordinary no-match is successful and disabled groups are not gated");
+
+            result = SignatureSelection.select(repository, currentProgram,
+                root.resolve("missing-yara").toString(), 1, monitor, new MessageLog());
+            check(!result.success(), "missing YARA marks gated selection as failed");
+            check(result.signatures().stream().map(java.io.File::toPath).collect(Collectors.toSet())
+                .equals(Set.of(plain, child)), "unconditional groups remain usable without a YARA executable");
+
+            ProgramDB noOriginal = independentProgram("grouped-without-original-file");
+            try {
+                result = SignatureSelection.select(repository, noOriginal, nativeYara(), 10,
+                    monitor, new MessageLog());
+                check(!result.success(), "missing original bytes are reported for gated groups");
+                check(result.signatures().stream().map(java.io.File::toPath).collect(Collectors.toSet())
+                    .equals(Set.of(plain, child)), "missing original bytes do not block unconditional groups");
+            }
+            finally {
+                noOriginal.release(this);
+            }
+        }
+        finally {
+            removeTemporaryDirectory(root);
+        }
+    }
+
+    private void testGroupedSignatureProvenance() throws Exception {
+        Path root = Files.createTempDirectory("siganalyzer-group-provenance-");
+        try {
+            byte[] pattern = pattern((byte) 0xf0);
+            put(0x2680, pattern);
+            Function function = function(0x2680, 32, null);
+            byte[] encoded = signature(pattern, 0, 0, 0, 32, export(0, "same_grouped_export", 0));
+            Path left = Files.createDirectories(root.resolve("left"));
+            Path right = Files.createDirectories(root.resolve("right"));
+            Path first = Files.write(left.resolve("same.sig"), encoded);
+            Path second = Files.write(right.resolve("same.sig"), encoded);
+            FlirtAnalysisSession session = new FlirtAnalysisSession(currentProgram);
+            check(session.run(List.of(first.toFile(), second.toFile()), root,
+                monitor, new MessageLog()), "grouped signatures accepted");
+            check("same_grouped_export".equals(function.getName()), "same-name grouped exports applied");
+            check(function.getComment().contains("left/same.sig") &&
+                function.getComment().contains("right/same.sig"),
+                "relative group paths keep identical basenames distinct in provenance");
+            check(session.getConflicts().isEmpty(), "same-name grouped exports do not conflict");
+        }
+        finally {
+            removeTemporaryDirectory(root);
+        }
+    }
+
+    private static void removeTemporaryDirectory(Path directory) throws Exception {
+        try (var paths = Files.walk(directory)) {
+            for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(path);
+            }
+        }
     }
 
     private static Set<String> namesAt(FlirtAnalysisSession session, Function function) {

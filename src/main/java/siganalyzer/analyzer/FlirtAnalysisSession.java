@@ -2,6 +2,7 @@ package siganalyzer.analyzer;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -70,6 +71,11 @@ public final class FlirtAnalysisSession {
 
     public boolean run(List<File> signatureFiles, TaskMonitor monitor, MessageLog log)
             throws CancelledException {
+        return run(signatureFiles, null, monitor, log);
+    }
+
+    public boolean run(List<File> signatureFiles, Path signatureRoot, TaskMonitor monitor, MessageLog log)
+            throws CancelledException {
         appliedCount = 0;
         errorMessage = null;
         conflicts = List.of();
@@ -77,14 +83,26 @@ public final class FlirtAnalysisSession {
         boolean success = true;
         for (File file : signatureFiles) {
             monitor.checkCancelled();
-            monitor.setMessage("Reading FLIRT candidates: " + file.getName());
+            String signatureName = file.getName();
+            if (signatureRoot != null) {
+                Path path = file.toPath().toAbsolutePath().normalize();
+                Path root = signatureRoot.toAbsolutePath().normalize();
+                if (!path.startsWith(root)) {
+                    errorMessage = "Signature is outside the configured repository: " + file;
+                    log.appendMsg("SigAnalyzer", errorMessage);
+                    success = false;
+                    continue;
+                }
+                signatureName = root.relativize(path).toString().replace('\\', '/');
+            }
+            monitor.setMessage("Reading FLIRT candidates: " + signatureName);
             try {
-                modules.addAll(new ApplyFlirt(program, file).collectMatches(monitor));
+                modules.addAll(new ApplyFlirt(program, file, signatureName).collectMatches(monitor));
             }
             catch (IOException | IllegalArgumentException e) {
                 monitor.checkCancelled();
                 success = false;
-                errorMessage = file.getName() + ": " + e.getMessage();
+                errorMessage = signatureName + ": " + e.getMessage();
                 log.appendMsg("SigAnalyzer", errorMessage);
             }
         }

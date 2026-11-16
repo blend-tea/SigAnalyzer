@@ -32,5 +32,20 @@
     address, signature file and library. Double-click a row or press Enter to navigate
     to its function. Use <B>Tools &gt; SigAnalyzer &gt; FLIRT Conflicts</B> to reopen the
     latest report. Several signatures agreeing on one name do not create a conflict.</P>
+    <P>Right-click a candidate and choose <B>Apply FLIRT Candidate</B> to apply an
+    explicit choice after analysis finishes. The name becomes user-defined and
+    retains its FLIRT provenance. Ghidra Undo/Redo is supported. Function ID results,
+    imported names and entry points remain protected.</P>
+    <H2><a name="SignatureGroups"></a>Signature Groups and YARA</H2>
+    <P>In the signature manager, select or create a directory group and add or move
+    signatures into it. Existing signatures remain in the default group.</P>
+    <P>Use <B>Edit rule</B> or <B>Import rule</B> to add an optional rules.yar. At least
+    one YARA rule must match the original imported binary before the signatures directly
+    in that folder are analyzed. Child folders do not inherit rules. Remove the rule
+    to analyze that group without a YARA condition.</P>
+    <P>Install native YARA 4 or configure its full executable path in the SigAnalyzer
+    analysis options. The scan timeout defaults to 30 seconds per group. Rule errors,
+    missing YARA or missing original bytes skip only the affected group and are reported
+    in the analysis log. Groups without rules do not require YARA.</P>
   </BODY>
 </HTML>

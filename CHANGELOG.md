@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0 — 2026-11-16
+
+- Apply a selected FLIRT conflict candidate using the right-click menu. The
+  explicit choice is undoable, retains provenance and is protected from later
+  automatic renaming. Function ID, imported names and entry points remain protected.
+- Organize registered signatures into directories, including nested groups,
+  and move signatures between groups while preserving their enabled state.
+- Add an optional `rules.yar` editor/import per directory. Native YARA matches
+  the original imported binary before enabling that directory's signatures;
+  rules do not affect subdirectories. Ungated groups retain their existing behavior.
+- Skip only the gated group when YARA is unavailable, rules are invalid, the
+  scan times out or the original imported bytes cannot be read.
+- Include relative group paths in conflict reports and FLIRT comments.
+- Add native YARA integration tests to the release workflow.
+- Update the English and Japanese READMEs with the new workflows and screenshots.
+
 ## 0.3.0 — 2026-11-13
 
 - Run FLIRT after Function ID and exclude functions identified by FID, including
