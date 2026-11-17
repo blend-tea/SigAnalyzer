@@ -22,6 +22,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
@@ -105,12 +106,13 @@ public class ApplyFlirt {
             throws CancelledException, IOException {
         monitor = taskMonitor;
         collectedMatches.clear();
+        errorMessage = null;
         monitor.checkCancelled();
         try (DataInputStream input = new DataInputStream(new FileInputStream(sigFile))) {
             FlirtNode node = flirtParse(new Flirt(input));
             monitor.checkCancelled();
             if (node == null) {
-                throw new IOException("Invalid or unsupported FLIRT signature");
+                throw new IOException(errorMessage != null ? errorMessage : "Invalid or unsupported FLIRT signature");
             }
             entryPointAddresses = getEntryPointAddresses();
             nodeMatchFunctions(node);
@@ -242,6 +244,7 @@ public class ApplyFlirt {
     private static final int IDASIG_FEATURE_2BYTE_CTYPE = 0x04;
     private static final int IDASIG_FEATURE_ALT_CTYPE_CRC = 0x08;
     private static final int IDASIG_FEATURE_COMPRESSED = 0x10;
+    private static final int IDASIG_FEATURE_ZSTD = 0x40;
 
     // Parsing flags
     private static final int IDASIG_PARSE_MORE_PUBLIC_NAMES = 0x01;
@@ -306,23 +309,52 @@ public class ApplyFlirt {
     private static class FlirtFunction {
         String name;
         long offset;
+        int flags;
+        FlirtInstructionBits instructionBits;
+        FlirtExtra40 extra40;
         boolean negativeOffset;
         boolean isLocal;
         boolean isCollision;
     }
 
+    private static class FlirtInstructionBits {
+        long mask;
+        long value;
+    }
+
+    private static class FlirtExtra40 {
+        long a;
+        int b;
+        int c;
+    }
+
+    private static class FlirtSite {
+        long offset;
+        String name;
+        int flags;
+        FlirtInstructionBits instructionBits;
+        FlirtExtra40 extra40;
+        Long extra08;
+    }
+
     private static class FlirtModule {
+        int version;
+        int patternSize;
+        int parseFlags;
         int crcLength;
         int crc16;
         long length;
         List<FlirtFunction> publicFunctions;
         List<FlirtTailByte> tailBytes;
         List<FlirtFunction> referencedFunctions;
+        List<FlirtSite> sites;
+        List<List<FlirtSite>> alternativeSites;
     }
 
     // RFlirt 
     private static class Flirt {
         private byte version;
+        private int patternSize = 32;
         private int headerSize;
         private DataInputStream b;
         private boolean bufEof;
@@ -338,6 +370,7 @@ public class ApplyFlirt {
         List<FlirtModule> moduleList;
         int length;
         long variantMask;
+        byte[] variantBitmap;
         byte[] patternBytes;
         boolean[] variantBoolArray;
     }
@@ -542,7 +575,10 @@ public class ApplyFlirt {
 
     private boolean moduleMatchBuffer(FlirtModule module, byte[] b, long address,
             int bufSize, int patternLength) {
-        int crcOffset = Math.max(32, patternLength);
+        int crcOffset = crcOffset(module, patternLength);
+        if (module.version >= 11 && module.length > bufSize) {
+            return false;
+        }
         if (module.crcLength > 0 && (crcOffset > bufSize ||
             module.crcLength > bufSize - crcOffset)) {
             return false;
@@ -558,6 +594,15 @@ public class ApplyFlirt {
                 }
             }
         }
+        // v11 encodes instruction constraints separately from wildcarded bytes.
+        for (FlirtFunction function : module.publicFunctions) {
+            if (!instructionMatches(function.instructionBits, function.offset, b, bufSize, address)) {
+                return false;
+            }
+        }
+        if (!siteInstructionsMatch(module.sites, b, bufSize, address)) {
+            return false;
+        }
         // Capture reference constraints now; resolve them after every signature was scanned.
         List<FlirtAnalysisSession.ReferenceConstraint> constraints = new ArrayList<>();
         if (module.referencedFunctions != null) {
@@ -567,6 +612,22 @@ public class ApplyFlirt {
                     return false;
                 }
                 constraints.add(constraint);
+            }
+        }
+        if (module.version >= 11 && !siteConstraints(module.sites, module.length, address, constraints)) {
+            return false;
+        }
+        List<List<FlirtAnalysisSession.ReferenceConstraint>> alternatives = new ArrayList<>();
+        if (module.alternativeSites != null && !module.alternativeSites.isEmpty()) {
+            for (List<FlirtSite> sites : module.alternativeSites) {
+                List<FlirtAnalysisSession.ReferenceConstraint> alternative = new ArrayList<>();
+                if (siteInstructionsMatch(sites, b, bufSize, address) &&
+                    siteConstraints(sites, module.length, address, alternative)) {
+                    alternatives.add(alternative);
+                }
+            }
+            if (alternatives.isEmpty()) {
+                return false;
             }
         }
         List<FlirtCandidate> candidates = new ArrayList<>();
@@ -594,7 +655,86 @@ public class ApplyFlirt {
             }
         }
         if (!candidates.isEmpty()) {
-            collectedMatches.add(new FlirtAnalysisSession.ModuleMatch(candidates, constraints));
+            collectedMatches.add(new FlirtAnalysisSession.ModuleMatch(candidates, constraints, alternatives));
+        }
+        return true;
+    }
+
+    private static int crcOffset(FlirtModule module, int patternLength) {
+        return module.version >= 11 ? module.patternSize : Math.max(32, patternLength);
+    }
+
+    private boolean instructionMatches(FlirtInstructionBits bits, long offset, byte[] bytes,
+            int size, long address) {
+        if (bits == null) {
+            return true;
+        }
+        byte[] word = new byte[4];
+        if (offset >= 0 && offset <= size - 4L) {
+            System.arraycopy(bytes, (int) offset, word, 0, 4);
+        }
+        else if (offset < 0) {
+            try {
+                if (memory.getBytes(matchingAddress(address).add(offset), word) != 4) {
+                    return false;
+                }
+            }
+            catch (MemoryAccessException | IllegalArgumentException | AddressOutOfBoundsException e) {
+                return false;
+            }
+        }
+        else {
+            return false;
+        }
+        long value = 0;
+        boolean bigEndian = program.getLanguage().isBigEndian();
+        for (int i = 0; i < 4; i++) {
+            value |= (long) (word[i] & 0xff) << (8 * (bigEndian ? 3 - i : i));
+        }
+        return ((value ^ bits.value) & bits.mask) == 0;
+    }
+
+    private boolean siteInstructionsMatch(List<FlirtSite> sites, byte[] bytes, int size, long address) {
+        if (sites != null) {
+            for (FlirtSite site : sites) {
+                if (!instructionMatches(site.instructionBits, site.offset, bytes, size, address)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean siteConstraints(List<FlirtSite> sites, long length, long address,
+            List<FlirtAnalysisSession.ReferenceConstraint> constraints) {
+        if (sites == null) {
+            return true;
+        }
+        for (FlirtSite site : sites) {
+            boolean tiny = length <= 16;
+            boolean named = site.name.length() >= 2 && (site.flags & 0x08) == 0;
+            if (!named) {
+                if (tiny) {
+                    return false;
+                }
+                continue;
+            }
+            boolean required = tiny || site.name.startsWith("__imp_");
+            if (!required && (site.flags & 0x20) != 0) {
+                continue;
+            }
+            FlirtFunction reference = new FlirtFunction();
+            reference.name = site.name;
+            reference.offset = site.offset;
+            var constraint = referenceConstraint(address, reference, true, required ? 0 : length);
+            if (constraint == null) {
+                if (required) {
+                    return false;
+                }
+                continue;
+            }
+            constraints.add(new FlirtAnalysisSession.ReferenceConstraint(constraint.name(),
+                constraint.targets(), constraint.knownNames(), constraint.existingNames(), !required, true));
         }
         return true;
     }
@@ -607,6 +747,16 @@ public class ApplyFlirt {
 
     private FlirtAnalysisSession.ReferenceConstraint referenceConstraint(long address,
             FlirtFunction reference) {
+        return referenceConstraint(address, reference, false);
+    }
+
+    private FlirtAnalysisSession.ReferenceConstraint referenceConstraint(long address,
+            FlirtFunction reference, boolean modernSite) {
+        return referenceConstraint(address, reference, modernSite, 0);
+    }
+
+    private FlirtAnalysisSession.ReferenceConstraint referenceConstraint(long address,
+            FlirtFunction reference, boolean modernSite, long ignoreWithinModule) {
         try {
             Address start = matchingAddress(address);
             Address refAddress = start.add(reference.negativeOffset ? -reference.offset : reference.offset);
@@ -615,36 +765,29 @@ public class ApplyFlirt {
                 return null;
             }
             Set<Address> targets = new LinkedHashSet<>();
+            Set<Address> destinations = new LinkedHashSet<>();
             Set<String> knownNames = new LinkedHashSet<>();
             Map<Address, Set<String>> existingNames = new LinkedHashMap<>();
-            // Relocations can point inside an instruction's operand.
             for (Reference target : instruction.getReferencesFrom()) {
                 Address destination = target.getToAddress();
-                targets.add(destination);
-                Function callee = functionManager.getFunctionAt(destination);
-                boolean priorFlirt = callee != null && FlirtFunctionMarkup.isFlirt(callee) &&
-                    !FlirtFunctionMarkup.isFunctionId(callee);
-                if (callee != null) {
-                    if (!priorFlirt) {
-                        addExistingName(callee.getEntryPoint(), callee.getName(),
-                            isTrustedName(callee), knownNames, existingNames);
+                destinations.add(destination);
+                if (modernSite && functionManager.getFunctionAt(destination) == null) {
+                    // Indirect x86 imports refer to an IAT pointer whose outgoing data
+                    // reference carries the external function's name.
+                    Data data = program.getListing().getDataAt(destination);
+                    if (data != null && data.getValue() instanceof Address pointer) {
+                        destinations.add(pointer);
                     }
-                    Function thunked = callee.getThunkedFunction(true);
-                    if (thunked != null) {
-                        targets.add(thunked.getEntryPoint());
-                        if (!FlirtFunctionMarkup.isFlirt(thunked) || FlirtFunctionMarkup.isFunctionId(thunked)) {
-                            addExistingName(thunked.getEntryPoint(), thunked.getName(),
-                                isTrustedName(thunked), knownNames, existingNames);
+                    for (Reference indirect : program.getReferenceManager().getReferencesFrom(destination)) {
+                        if (indirect.getReferenceType().isData()) {
+                            destinations.add(indirect.getToAddress());
                         }
                     }
                 }
-                for (Symbol symbol : program.getSymbolTable().getSymbols(destination)) {
-                    if (!priorFlirt || symbol.getSource() != SourceType.ANALYSIS) {
-                        boolean trusted = symbol.getSource() == SourceType.USER_DEFINED ||
-                            symbol.getSource() == SourceType.IMPORTED ||
-                            (callee != null && FlirtFunctionMarkup.isFunctionId(callee));
-                        addExistingName(destination, symbol.getName(), trusted, knownNames, existingNames);
-                    }
+            }
+            for (Address destination : destinations) {
+                if (!withinModule(destination, start, ignoreWithinModule)) {
+                    collectTarget(destination, modernSite, targets, knownNames, existingNames);
                 }
             }
             return targets.isEmpty() ? null : new FlirtAnalysisSession.ReferenceConstraint(
@@ -652,6 +795,44 @@ public class ApplyFlirt {
         }
         catch (IllegalArgumentException | AddressOutOfBoundsException e) {
             return null;
+        }
+    }
+
+    private static boolean withinModule(Address target, Address start, long length) {
+        return length > 0 && target.getAddressSpace().equals(start.getAddressSpace()) &&
+            Long.compareUnsigned(target.getOffset(), start.getOffset()) >= 0 &&
+            Long.compareUnsigned(target.getOffset() - start.getOffset(), length) < 0;
+    }
+
+    private void collectTarget(Address destination, boolean ignoreDefaultNames, Set<Address> targets,
+            Set<String> knownNames, Map<Address, Set<String>> existingNames) {
+        targets.add(destination);
+        Function callee = functionManager.getFunctionAt(destination);
+        boolean priorFlirt = callee != null && FlirtFunctionMarkup.isFlirt(callee) &&
+            !FlirtFunctionMarkup.isFunctionId(callee);
+        if (callee != null) {
+            if (!priorFlirt && (!ignoreDefaultNames || callee.getSymbol().getSource() != SourceType.DEFAULT)) {
+                addExistingName(callee.getEntryPoint(), callee.getName(),
+                    isTrustedName(callee), knownNames, existingNames);
+            }
+            Function thunked = callee.getThunkedFunction(true);
+            if (thunked != null) {
+                targets.add(thunked.getEntryPoint());
+                if ((!FlirtFunctionMarkup.isFlirt(thunked) || FlirtFunctionMarkup.isFunctionId(thunked)) &&
+                    (!ignoreDefaultNames || thunked.getSymbol().getSource() != SourceType.DEFAULT)) {
+                    addExistingName(thunked.getEntryPoint(), thunked.getName(),
+                        isTrustedName(thunked), knownNames, existingNames);
+                }
+            }
+        }
+        for (Symbol symbol : program.getSymbolTable().getSymbols(destination)) {
+            if ((!priorFlirt || symbol.getSource() != SourceType.ANALYSIS) &&
+                (!ignoreDefaultNames || symbol.getSource() != SourceType.DEFAULT)) {
+                boolean trusted = symbol.getSource() == SourceType.USER_DEFINED ||
+                    symbol.getSource() == SourceType.IMPORTED ||
+                    (callee != null && FlirtFunctionMarkup.isFunctionId(callee));
+                addExistingName(destination, symbol.getName(), trusted, knownNames, existingNames);
+            }
         }
     }
 
@@ -713,12 +894,38 @@ public class ApplyFlirt {
         }
         if (node.moduleList != null) {
             for (FlirtModule module : node.moduleList) {
-                long crcEnd = Math.max(32, patternLength) + module.crcLength;
+                long crcEnd = (long) crcOffset(module, (int) patternLength) + module.crcLength;
+                if (module.version >= 11) {
+                    extent = Math.max(extent, module.length);
+                }
+                for (FlirtFunction function : module.publicFunctions) {
+                    if (function.instructionBits != null && function.offset >= 0) {
+                        extent = Math.max(extent, function.offset + 4);
+                    }
+                }
+                extent = Math.max(extent, siteExtent(module.sites));
+                if (module.alternativeSites != null) {
+                    for (List<FlirtSite> sites : module.alternativeSites) {
+                        extent = Math.max(extent, siteExtent(sites));
+                    }
+                }
                 if (module.crcLength > 0) {
                     extent = Math.max(extent, crcEnd);
                 }
                 for (FlirtTailByte tail : module.tailBytes) {
                     extent = Math.max(extent, crcEnd + tail.offset + 1);
+                }
+            }
+        }
+        return extent;
+    }
+
+    private static long siteExtent(List<FlirtSite> sites) {
+        long extent = 0;
+        if (sites != null) {
+            for (FlirtSite site : sites) {
+                if (site.instructionBits != null) {
+                    extent = Math.max(extent, site.offset + 4);
                 }
             }
         }
@@ -764,7 +971,7 @@ public class ApplyFlirt {
 
     private boolean readModuleTailBytes(Flirt f, FlirtModule module) {
         try {
-            int count = readConstraintCount(f);
+            int count = f.version >= 11 ? readByte(f) & 0xff : readConstraintCount(f);
             for (int i = 0; i < count; i++) {
                 FlirtTailByte tail = new FlirtTailByte();
                 tail.offset = readOffset(f);
@@ -780,13 +987,22 @@ public class ApplyFlirt {
 
     private boolean readModuleReferencedFunctions(Flirt f, FlirtModule module) {
         try {
-            int count = readConstraintCount(f);
+            int count;
+            if (f.version >= 11) {
+                // IDA's v11 reader consumes this byte but reads one legacy reference.
+                readByte(f);
+                count = 1;
+            }
+            else {
+                count = readConstraintCount(f);
+            }
             for (int i = 0; i < count; i++) {
                 FlirtFunction function = new FlirtFunction();
                 function.offset = readOffset(f);
                 long length = readByte(f) & 0xff;
                 if (length == 0) {
-                    length = Integer.toUnsignedLong(readMultipleBytes(f));
+                    length = f.version >= 11 ? readMax2Bytes(f) & 0xffff :
+                        Integer.toUnsignedLong(readMultipleBytes(f));
                 }
                 if (length == 0 || length >= R_FLIRT_NAME_MAX) {
                     return false;
@@ -794,7 +1010,10 @@ public class ApplyFlirt {
                 byte[] name = new byte[(int) length];
                 f.b.readFully(name);
                 function.negativeOffset = name[name.length - 1] == 0;
-                int nameLength = function.negativeOffset ? name.length - 1 : name.length;
+                int nameLength = name.length;
+                while (nameLength > 0 && name[nameLength - 1] == 0) {
+                    nameLength--;
+                }
                 function.name = new String(name, 0, nameLength, StandardCharsets.ISO_8859_1);
                 if (function.name.isEmpty()) {
                     return false;
@@ -814,30 +1033,46 @@ public class ApplyFlirt {
             int flags;
             do {
                 FlirtFunction function = new FlirtFunction();
-                offset += readOffset(f);
-                if (offset > 0xffffffffL) {
-                    return false;
+                long delta = readOffset(f);
+                if (f.version >= 11) {
+                    int length = readShort(f) & 0xffff;
+                    function.flags = readByte(f) & 0xff;
+                    function.name = readLengthPrefixedName(f, length);
+                    function.instructionBits = readInstructionBits(f, function.flags);
+                    function.extra40 = readExtra40(f, function.flags);
+                    offset += (function.flags & 0x10) != 0 ? -delta : delta;
+                    function.offset = offset;
+                    function.isLocal = (function.flags & IDASIG_FUNCTION_LOCAL) != 0;
+                    function.isCollision = (function.flags & IDASIG_FUNCTION_UNRESOLVED_COLLISION) != 0;
+                    flags = readByte(f) & 0xff;
                 }
-                function.offset = offset;
-                int current = readByte(f) & 0xff;
-                if (current < 0x20) {
-                    function.isLocal = (current & IDASIG_FUNCTION_LOCAL) != 0;
-                    function.isCollision = (current & IDASIG_FUNCTION_UNRESOLVED_COLLISION) != 0;
-                    current = readByte(f) & 0xff;
-                }
-                StringBuilder name = new StringBuilder();
-                while (current >= 0x20) {
-                    if (name.length() >= R_FLIRT_NAME_MAX) {
+                else {
+                    offset += delta;
+                    if (offset > 0xffffffffL) {
                         return false;
                     }
-                    name.append((char) current);
-                    current = readByte(f) & 0xff;
+                    function.offset = offset;
+                    int current = readByte(f) & 0xff;
+                    if (current < 0x20) {
+                        function.flags = current;
+                        function.isLocal = (current & IDASIG_FUNCTION_LOCAL) != 0;
+                        function.isCollision = (current & IDASIG_FUNCTION_UNRESOLVED_COLLISION) != 0;
+                        current = readByte(f) & 0xff;
+                    }
+                    StringBuilder name = new StringBuilder();
+                    while (current >= 0x20) {
+                        if (name.length() >= R_FLIRT_NAME_MAX) {
+                            return false;
+                        }
+                        name.append((char) current);
+                        current = readByte(f) & 0xff;
+                    }
+                    if (name.length() == 0) {
+                        return false;
+                    }
+                    function.name = name.toString();
+                    flags = current;
                 }
-                if (name.length() == 0) {
-                    return false;
-                }
-                function.name = name.toString();
-                flags = current;
                 module.publicFunctions.add(function);
             } while ((flags & IDASIG_PARSE_MORE_PUBLIC_NAMES) != 0);
             outFlags[0] = (byte) flags;
@@ -846,6 +1081,55 @@ public class ApplyFlirt {
         catch (IOException e) {
             return false;
         }
+    }
+
+    private String readLengthPrefixedName(Flirt f, int length) throws IOException {
+        byte[] bytes = new byte[length];
+        f.b.readFully(bytes);
+        return new String(bytes, StandardCharsets.ISO_8859_1);
+    }
+
+    private FlirtInstructionBits readInstructionBits(Flirt f, int flags) throws IOException {
+        if ((flags & 0x80) == 0) {
+            return null;
+        }
+        FlirtInstructionBits bits = new FlirtInstructionBits();
+        bits.mask = Integer.toUnsignedLong(readMultipleBytes(f));
+        bits.value = Integer.toUnsignedLong(readMultipleBytes(f));
+        return bits;
+    }
+
+    private FlirtExtra40 readExtra40(Flirt f, int flags) throws IOException {
+        if ((flags & 0x40) == 0) {
+            return null;
+        }
+        FlirtExtra40 extra = new FlirtExtra40();
+        extra.a = Integer.toUnsignedLong(readMultipleBytes(f));
+        extra.b = readShort(f) & 0xffff;
+        extra.c = readByte(f) & 0xff;
+        return extra;
+    }
+
+    private List<FlirtSite> readSites(Flirt f) throws IOException {
+        long count = Integer.toUnsignedLong(readMultipleBytes(f));
+        if (count > f.b.available() / 4) {
+            throw new IOException("Invalid FLIRT relocation-site count");
+        }
+        List<FlirtSite> sites = new ArrayList<>();
+        for (long i = 0; i < count; i++) {
+            FlirtSite site = new FlirtSite();
+            site.offset = Integer.toUnsignedLong(readMultipleBytes(f));
+            int length = readShort(f) & 0xffff;
+            site.name = readLengthPrefixedName(f, length);
+            site.flags = readByte(f) & 0xff;
+            site.instructionBits = readInstructionBits(f, site.flags);
+            site.extra40 = readExtra40(f, site.flags);
+            if ((site.flags & 0x08) != 0) {
+                site.extra08 = Integer.toUnsignedLong(readMultipleBytes(f));
+            }
+            sites.add(site);
+        }
+        return sites;
     }
 
     private boolean parseLeaf(Flirt f, FlirtNode node) {
@@ -857,9 +1141,13 @@ public class ApplyFlirt {
                 int expectedCrc = readShort(f) & 0xffff;
                 do {
                     FlirtModule module = new FlirtModule();
+                    module.version = f.version & 0xff;
+                    module.patternSize = f.patternSize;
                     module.publicFunctions = new ArrayList<>();
                     module.tailBytes = new ArrayList<>();
                     module.referencedFunctions = new ArrayList<>();
+                    module.sites = new ArrayList<>();
+                    module.alternativeSites = new ArrayList<>();
                     module.crcLength = crcLength;
                     module.crc16 = expectedCrc;
                     module.length = readOffset(f);
@@ -869,6 +1157,24 @@ public class ApplyFlirt {
                         ((flags[0] & IDASIG_PARSE_READ_REFERENCED_FUNCTIONS) != 0 &&
                             !readModuleReferencedFunctions(f, module))) {
                         return false;
+                    }
+                    module.parseFlags = flags[0] & 0xff;
+                    if (f.version >= 11) {
+                        if ((module.parseFlags & 0x20) != 0) {
+                            module.sites = readSites(f);
+                        }
+                        if ((module.parseFlags & 0x40) != 0) {
+                            long count = Integer.toUnsignedLong(readMultipleBytes(f));
+                            if (count > f.b.available()) {
+                                return false;
+                            }
+                            for (long i = 0; i < count; i++) {
+                                module.alternativeSites.add(readSites(f));
+                            }
+                        }
+                        if ((module.parseFlags & 0x80) != 0) {
+                            return false;
+                        }
                     }
                     node.moduleList.add(module);
                 } while ((flags[0] & IDASIG_PARSE_MORE_MODULES_WITH_SAME_CRC) != 0);
@@ -882,8 +1188,8 @@ public class ApplyFlirt {
 
     private boolean readNodeLength(Flirt f, FlirtNode node) {
         try {
-            node.length = readByte(f) & 0xFF;
-            if (node.length == 0 || node.length > 64) {
+            node.length = f.version >= 10 ? readMax2Bytes(f) & 0xffff : readByte(f) & 0xff;
+            if (node.length == 0 || node.length > f.patternSize) {
                 return false;
             }
         }
@@ -905,6 +1211,17 @@ public class ApplyFlirt {
                 node.variantMask = (Integer.toUnsignedLong(readMultipleBytes(f)) << 32) |
                     Integer.toUnsignedLong(readMultipleBytes(f));
             }
+            else {
+                // Long nodes store their mask as little-endian bitmap bytes, with the
+                // most significant logical bit still describing the first pattern byte.
+                node.variantBitmap = new byte[(node.length + 7) / 8];
+                f.b.readFully(node.variantBitmap);
+                int usedBits = node.length & 7;
+                if (usedBits != 0) {
+                    node.variantBitmap[node.variantBitmap.length - 1] &= (1 << usedBits) - 1;
+                }
+                return true;
+            }
             return node.length == 64 || (node.variantMask >>> node.length) == 0;
         }
         catch (IOException e) {
@@ -917,17 +1234,16 @@ public class ApplyFlirt {
         if (node.length < 0) {
             return false;
         }
-        if (node.length > 64) {
-            return false;
-        }
-
         node.patternBytes = new byte[node.length];
         node.variantBoolArray = new boolean[node.length];
 
         long currentMaskBit = 1L << (node.length - 1);
         for (i = 0; i < node.length; i++, currentMaskBit >>>= 1) {
-            node.variantBoolArray[i] = (node.variantMask & currentMaskBit) != 0;
-            if ((node.variantMask & currentMaskBit) != 0) {
+            int bit = node.length - 1 - i;
+            node.variantBoolArray[i] = node.variantBitmap != null ?
+                (node.variantBitmap[bit >>> 3] & (1 << (bit & 7))) != 0 :
+                (node.variantMask & currentMaskBit) != 0;
+            if (node.variantBoolArray[i]) {
                 node.patternBytes[i] = 0;
             }
             else {
@@ -943,16 +1259,21 @@ public class ApplyFlirt {
     }
 
     private boolean parseTree(Flirt f, FlirtNode rootNode) {
-        return parseTree(f, rootNode, 0);
+        return parseTree(f, rootNode, 0, 0);
     }
 
     private boolean parseTree(Flirt f, FlirtNode rootNode, int depth) {
+        return parseTree(f, rootNode, depth, 0);
+    }
+
+    private boolean parseTree(Flirt f, FlirtNode rootNode, int depth, int patternLength) {
         try {
             // Bound recursion on malformed files before the Java stack can overflow.
             if (depth > 256) {
                 return false;
             }
-            long count = Integer.toUnsignedLong(readMultipleBytes(f));
+            long count = f.version >= 11 ? readMax2Bytes(f) & 0xffff :
+                Integer.toUnsignedLong(readMultipleBytes(f));
             if (count == 0) {
                 return parseLeaf(f, rootNode);
             }
@@ -963,7 +1284,9 @@ public class ApplyFlirt {
             for (long i = 0; i < count; i++) {
                 FlirtNode child = new FlirtNode();
                 if (!readNodeLength(f, child) || !readNodeVariantMask(f, child) ||
-                    !readNodeBytes(f, child) || !parseTree(f, child, depth + 1)) {
+                    !readNodeBytes(f, child) ||
+                    patternLength + child.length > f.patternSize ||
+                    !parseTree(f, child, depth + 1, patternLength + child.length)) {
                     return false;
                 }
                 rootNode.childList.add(child);
@@ -1006,6 +1329,8 @@ public class ApplyFlirt {
         header.ctypesCrc16 = parsedV5.ctypesCrc16;
 
         f.version = header.version;
+        f.patternSize = headerInfo.getV8V9() != null ?
+            headerInfo.getV8V9().patternSize & 0xffff : 32;
 
         String magic = new String(header.magic);
         if (!magic.equals("IDASGN")) {
@@ -1039,6 +1364,11 @@ public class ApplyFlirt {
             f.b.readFully(buf);
         }
         catch (IOException e) {
+            return null;
+        }
+
+        if ((header.features & IDASIG_FEATURE_ZSTD) != 0) {
+            errorMessage = "Zstd-compressed FLIRT signatures are not supported";
             return null;
         }
 

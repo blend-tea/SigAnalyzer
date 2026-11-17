@@ -46,10 +46,18 @@ public class FlirtHeaderParser {
 	}
 
 	/**
-	 * FLIRT signature file header structure (version 10)
+	 * FLIRT signature file header structure (version 10+)
 	 */
 	public static class IdasigV10 {
 		public short unknown;
+	}
+
+	/**
+	 * FLIRT signature file header structure (version 11).
+	 * The toolchain byte follows the V10 extension and precedes the library name.
+	 */
+	public static class IdasigV11 {
+		public byte toolchain;
 	}
 
 	/**
@@ -60,14 +68,21 @@ public class FlirtHeaderParser {
 		private IdasigV6V7 v6v7;
 		private IdasigV8V9 v8v9;
 		private IdasigV10 v10;
+		private IdasigV11 v11;
 		private String libraryName;
 
 		public HeaderInfo(IdasigV5 v5, IdasigV6V7 v6v7, IdasigV8V9 v8v9, IdasigV10 v10,
 				String libraryName) {
+			this(v5, v6v7, v8v9, v10, null, libraryName);
+		}
+
+		public HeaderInfo(IdasigV5 v5, IdasigV6V7 v6v7, IdasigV8V9 v8v9, IdasigV10 v10,
+				IdasigV11 v11, String libraryName) {
 			this.v5 = v5;
 			this.v6v7 = v6v7;
 			this.v8v9 = v8v9;
 			this.v10 = v10;
+			this.v11 = v11;
 			this.libraryName = libraryName;
 		}
 
@@ -85,6 +100,10 @@ public class FlirtHeaderParser {
 
 		public IdasigV10 getV10() {
 			return v10;
+		}
+
+		public IdasigV11 getV11() {
+			return v11;
 		}
 
 		public String getLibraryName() {
@@ -175,6 +194,15 @@ public class FlirtHeaderParser {
 	}
 
 	/**
+	 * Parses the V11 header structure.
+	 */
+	private static IdasigV11 parseV11Header(DataInputStream dis) throws IOException {
+		IdasigV11 header = new IdasigV11();
+		header.toolchain = readByte(dis);
+		return header;
+	}
+
+	/**
 	 * Parses the FLIRT signature file header
 	 * 
 	 * @param dis DataInputStream positioned at the start of the file
@@ -190,7 +218,7 @@ public class FlirtHeaderParser {
 			}
 
 			byte version = v5.version;
-			if (version < 5 || version > 10) {
+			if (version < 5 || version > 11) {
 				return null;
 			}
 
@@ -198,6 +226,7 @@ public class FlirtHeaderParser {
 			IdasigV6V7 v6v7 = null;
 			IdasigV8V9 v8v9 = null;
 			IdasigV10 v10 = null;
+			IdasigV11 v11 = null;
 
 			if (version >= 6) {
 				v6v7 = parseV6V7Header(dis);
@@ -208,6 +237,9 @@ public class FlirtHeaderParser {
 			if (version >= 10) {
 				v10 = parseV10Header(dis);
 			}
+			if (version >= 11) {
+				v11 = parseV11Header(dis);
+			}
 
 			// Read library name
 			int libraryNameLen = Byte.toUnsignedInt(v5.libraryNameLen);
@@ -215,7 +247,7 @@ public class FlirtHeaderParser {
 			dis.readFully(nameBytes);
 			String libraryName = new String(nameBytes, StandardCharsets.UTF_8);
 
-			return new HeaderInfo(v5, v6v7, v8v9, v10, libraryName);
+			return new HeaderInfo(v5, v6v7, v8v9, v10, v11, libraryName);
 		}
 		catch (IOException e) {
 			return null;

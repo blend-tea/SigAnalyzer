@@ -64,6 +64,12 @@ public class SigAnalyzerSmokeTest extends GhidraScript {
         testGroupedSignatureProvenance();
         testClosingProgramClearsOverlayReport();
         testYaraToolOptionsExecutableSelection();
+        testVersion11SignaturesAndReferences();
+        testVersion11InstructionBitsAndCrcBase();
+        testVersion11OptionalAndTinySites();
+        testVersion11AlternativeSites();
+        testVersion11OptionalEvidenceDoesNotHideAConflict();
+        testVersion11InternalAndMutualSites();
         println("SIGANALYZER_SMOKE_TEST_PASSED");
     }
 
@@ -838,6 +844,291 @@ public class SigAnalyzerSmokeTest extends GhidraScript {
         return "'" + value.replace("'", "'\\''") + "'";
     }
 
+    private void testVersion11SignaturesAndReferences() throws Exception {
+        Path directory = Files.createTempDirectory("siganalyzer-v11-smoke-");
+        try {
+            for (int compressed = 0; compressed < 2; compressed++) {
+                long callerAddress = 0x2700 + compressed * 0x80;
+                long calleeAddress = callerAddress + 0x40;
+                byte[] pattern = callPattern(callerAddress, calleeAddress, (byte) (0x83 + compressed));
+                put(callerAddress, pattern);
+                put(callerAddress + 32, CRC_VECTOR);
+                put(calleeAddress, new byte[] {(byte) 0xc3});
+                Function caller = function(callerAddress, 41, null);
+                Function callee = function(calleeAddress, 1, "unrelated_v11_target_" + compressed);
+                disassemble(toAddr(callerAddress));
+                String target = "expected_v11_target_" + compressed;
+                String name = "synthetic_v11_export_" + compressed;
+                byte[] reference = target.getBytes(StandardCharsets.US_ASCII);
+                byte[] exports = concat(exportV11(0, name, 0, 4),
+                    new byte[] {1, 1, (byte) reference.length}, reference);
+                byte[] body = concat(new byte[] {1}, treeNode(pattern, callMask(), 9,
+                    0x6e90, 41, exports));
+                byte[] header = header(11, "Independent v11 smoke");
+                header[16] = (byte) (compressed == 1 ? 0x10 : 0);
+                byte[] encodedBody = compressed == 1 ? zlib(body) : body;
+                Path file = Files.write(directory.resolve(compressed == 1 ?
+                    "v11-compressed.sig" : "v11-plain.sig"), concat(header, encodedBody));
+                // Exercise the same complete-file metadata path used by the signature manager.
+                try (var input = new java.io.DataInputStream(Files.newInputStream(file))) {
+                    var info = siganalyzer.analyzer.FlirtHeaderParser.parseHeader(input);
+                    check(info != null && info.getVersion() == 11, "full v11 signature accepted by header importer");
+                    check("Independent v11 smoke".equals(info.getLibraryName()), "v11 library name starts after toolchain byte");
+                    check((info.getV11().toolchain & 0xff) == 0xa5, "v11 toolchain byte retained");
+                    check(input.available() == encodedBody.length, "v11 header importer leaves the entire tree unread");
+                }
+                String original = caller.getName();
+                ApplyFlirt apply = new ApplyFlirt(currentProgram, file.toFile());
+                check(apply.run(monitor), "v11 signature tree parses before reference resolution");
+                check(original.equals(caller.getName()), "v11 mismatching reference rejects rename");
+                callee.setName(target, SourceType.USER_DEFINED);
+                check(apply.run(monitor), "v11 signature accepted after reference resolution");
+                check(name.equals(caller.getName()), "v11 export applied for plain and zlib trees");
+                check(caller.getComment().contains("Independent v11 smoke") &&
+                    caller.getComment().contains(file.getFileName().toString()), "v11 rename carries parsed signature provenance");
+            }
+            byte[] unsupported = header(11, "Synthetic unsupported compression");
+            unsupported[16] = 0x40;
+            Path zstd = Files.write(directory.resolve("v11-zstd.sig"), concat(unsupported,
+                new byte[] {0x28, (byte) 0xb5, 0x2f, (byte) 0xfd}));
+            ApplyFlirt apply = new ApplyFlirt(currentProgram, zstd.toFile());
+            check(!apply.run(monitor), "unsupported Zstandard signatures are rejected explicitly");
+            String diagnostic = String.valueOf(apply.getErrorMessage()).toLowerCase(java.util.Locale.ROOT);
+            check(diagnostic.contains("zstd") || diagnostic.contains("zstandard"),
+                "unsupported Zstandard compression has a specific diagnostic");
+        }
+        finally {
+            removeTemporaryDirectory(directory);
+        }
+    }
+
+    private void testVersion11InstructionBitsAndCrcBase() throws Exception {
+        byte[] wildcardPattern = new byte[32];
+        byte[] publicMemory = pattern((byte) 0x90);
+        publicMemory[0] = 0x54;
+        put(0x2800, publicMemory);
+        Function publicBits = function(0x2800, 32, null);
+        String publicOriginal = publicBits.getName();
+        byte[] publicSignature = v11Signature(wildcardPattern, 0xffffffffL, 0, 0, 32,
+            exportV11(0, "v11_public_instruction_bits", 0x80, 0,
+                instructionBits(0xff, 0x12340055)), 32);
+        apply(publicSignature);
+        check(publicOriginal.equals(publicBits.getName()), "v11 public instruction-bit mismatch rejects rename");
+        put(0x2800, new byte[] {0x55});
+        apply(publicSignature);
+        check("v11_public_instruction_bits".equals(publicBits.getName()),
+            "v11 instruction matching ignores expected-value bits outside the mask");
+
+        byte[] sitePattern = pattern((byte) 0x85);
+        put(0x2900, sitePattern);
+        put(0x2928, new byte[] {0x54, 0x33, 0x22, 0x11});
+        Function siteBits = function(0x2900, 32, null);
+        String siteOriginal = siteBits.getName();
+        byte[] sites = concat(exportV11(0, "v11_distant_instruction_bits", 0, 0x20),
+            new byte[] {1}, siteV11(40, "", 0x80, instructionBits(0xff, 0x12340055)));
+        byte[] siteSignature = v11Signature(sitePattern, 0, 0, 0, 44, sites, 32);
+        apply(siteSignature);
+        check(siteOriginal.equals(siteBits.getName()), "v11 site instruction-bit mismatch rejects rename");
+        put(0x2928, new byte[] {0x55});
+        apply(siteSignature);
+        check("v11_distant_instruction_bits".equals(siteBits.getName()),
+            "v11 matching reads instruction bits beyond the pattern and first function body");
+
+        byte[] crcPattern = pattern((byte) 0x86);
+        put(0x2a00, crcPattern);
+        put(0x2a20, CRC_VECTOR); // a valid decoy at the legacy 32-byte CRC offset
+        byte[] wrong = CRC_VECTOR.clone();
+        wrong[0] ^= 1;
+        put(0x2a40, wrong);
+        Function crcFunction = function(0x2a00, 32, null);
+        String crcOriginal = crcFunction.getName();
+        byte[] crcSignature = v11Signature(crcPattern, 0, 9, 0x6e90, 73,
+            exportV11(0, "v11_header_pattern_crc", 0, 0), 64);
+        apply(crcSignature);
+        check(crcOriginal.equals(crcFunction.getName()), "v11 CRC uses the header pattern length rather than a 32-byte leaf");
+        put(0x2a40, CRC_VECTOR);
+        apply(crcSignature);
+        check("v11_header_pattern_crc".equals(crcFunction.getName()), "v11 CRC matches at the header's 64-byte offset");
+    }
+
+    private void testVersion11OptionalAndTinySites() throws Exception {
+        String expected = "ordinary_v11_site_target";
+        for (int evidence = 0; evidence < 3; evidence++) {
+            long callerAddress = 0x2b00 + evidence * 0x80;
+            long calleeAddress = callerAddress + 0x40;
+            byte[] pattern = callPattern(callerAddress, calleeAddress, (byte) (0x87 + evidence));
+            put(callerAddress, pattern);
+            put(calleeAddress, new byte[] {(byte) 0xc3});
+            Function caller = function(callerAddress, 32, null);
+            function(calleeAddress, 1, evidence == 0 ? null :
+                evidence == 1 ? expected : "mismatching_v11_site_target");
+            disassemble(toAddr(callerAddress));
+            String original = caller.getName();
+            String renamed = "v11_optional_site_" + evidence;
+            byte[] sites = concat(exportV11(0, renamed, 0, 0x20), new byte[] {1},
+                siteV11(1, expected, 0, new byte[0]));
+            apply(v11Signature(pattern, callMask(), 0, 0, 32, sites, 32));
+            check((evidence == 2 ? original : renamed).equals(caller.getName()),
+                "ordinary v11 site handles unknown, matching and mismatching names: " + evidence);
+        }
+
+        byte[] tiny = Arrays.copyOf(callPattern(0x2c80, 0x2cc0, (byte) 0x8a), 12);
+        put(0x2c80, tiny);
+        put(0x2cc0, new byte[] {(byte) 0xc3});
+        Function caller = function(0x2c80, 12, null);
+        function(0x2cc0, 1, null);
+        disassemble(toAddr(0x2c80));
+        String original = caller.getName();
+        byte[] sites = concat(exportV11(0, "v11_tiny_unproven", 0, 0x20), new byte[] {1},
+            siteV11(1, "unknown_tiny_v11_target", 0, new byte[0]));
+        long tinyMask = (1L << 10) | (1L << 9) | (1L << 8) | (1L << 7);
+        apply(v11Signature(tiny, tinyMask, 0, 0, 12, sites, 32));
+        check(original.equals(caller.getName()), "tiny v11 modules require positive site-name evidence");
+    }
+
+    private void testVersion11AlternativeSites() throws Exception {
+        for (int matches = 0; matches < 2; matches++) {
+            long callerAddress = 0x2d00 + matches * 0x80;
+            long calleeAddress = callerAddress + 0x40;
+            byte[] pattern = callPattern(callerAddress, calleeAddress, (byte) (0x8b + matches));
+            put(callerAddress, pattern);
+            put(calleeAddress, new byte[] {(byte) 0xc3});
+            Function caller = function(callerAddress, 32, null);
+            function(calleeAddress, 1, matches == 1 ? "matching_v11_alternative_target" :
+                "different_v11_alternative_target");
+            disassemble(toAddr(callerAddress));
+            String original = caller.getName();
+            String renamed = "v11_alternative_site_" + matches;
+            byte[] alternatives = concat(exportV11(0, renamed, 0, 0x40),
+                new byte[] {2, 1}, siteV11(1, "wrong_v11_alternative_target", 0, new byte[0]),
+                new byte[] {1}, siteV11(1, "matching_v11_alternative_target", 0, new byte[0]));
+            apply(v11Signature(pattern, callMask(), 0, 0, 32, alternatives, 32));
+            check((matches == 1 ? renamed : original).equals(caller.getName()),
+                "v11 alternative site tables match any one complete alternative: " + matches);
+        }
+    }
+
+    private void testVersion11OptionalEvidenceDoesNotHideAConflict() throws Exception {
+        byte[] callerPattern = callPattern(0x2e00, 0x2e40, (byte) 0x8d);
+        byte[] helperPattern = callPattern(0x2e40, 0x2ec0, (byte) 0x8e);
+        put(0x2e00, callerPattern);
+        put(0x2e40, helperPattern);
+        put(0x2ec0, new byte[] {(byte) 0xc3});
+        Function caller = function(0x2e00, 32, null);
+        Function helper = function(0x2e40, 32, null);
+        function(0x2ec0, 1, "concrete_required_mismatch");
+        disassemble(toAddr(0x2e00));
+        disassemble(toAddr(0x2e40));
+        String callerOriginal = caller.getName();
+        String helperOriginal = helper.getName();
+        byte[] optional = concat(exportV11(0, "optional_v11_a", 0, 0x20), new byte[] {1},
+            siteV11(1, "expected_optional_v11_target", 0, new byte[0]));
+        byte[] missing = "missing_grounded_reference".getBytes(StandardCharsets.US_ASCII);
+        byte[] impossible = concat(exportV11(0, "impossible_v11_callee_y", 0, 4),
+            new byte[] {1, 1, (byte) missing.length}, missing);
+        FlirtAnalysisSession session = analyze(new String[] {"optional-a.sig", "unconditional-z.sig",
+                "invalid-helper.sig"},
+            v11Signature(callerPattern, callMask(), 0, 0, 32, optional, 32),
+            v11Signature(callerPattern, callMask(), 0, 0, 32,
+                exportV11(0, "unconditional_v11_z", 0, 0), 32),
+            v11Signature(helperPattern, callMask(), 0, 0, 32, impossible, 32));
+        check(helperOriginal.equals(helper.getName()), "impossible mandatory helper candidate is pruned");
+        check(callerOriginal.equals(caller.getName()), "temporary optional mismatch must not select an arbitrary winner");
+        check(namesAt(session, caller).equals(Set.of("optional_v11_a", "unconditional_v11_z")),
+            "optional candidate remains in conflicts when contrary helper evidence disappears");
+    }
+
+    private void testVersion11InternalAndMutualSites() throws Exception {
+        byte[] internalPattern = callPattern(0x2f00, 0x2f40, (byte) 0x8f);
+        put(0x2f00, internalPattern);
+        put(0x2f40, new byte[] {(byte) 0xc3});
+        Function first = function(0x2f00, 32, null);
+        Function second = function(0x2f40, 32, null);
+        disassemble(toAddr(0x2f00));
+        byte[] exports = concat(exportV11(0, "v11_internal_first", 0, 1),
+            exportV11(64, "v11_internal_second", 0, 0x20), new byte[] {1},
+            siteV11(1, "v11_internal_second", 0, new byte[0]));
+        apply(v11Signature(internalPattern, callMask(), 0, 0, 96, exports, 32));
+        check("v11_internal_first".equals(first.getName()) &&
+            "v11_internal_second".equals(second.getName()),
+            "ordinary calls to another export in the same module do not block both exports");
+
+        byte[] firstPattern = callPattern(0x2f80, 0x2fc0, (byte) 0x93);
+        byte[] secondPattern = callPattern(0x2fc0, 0x2f80, (byte) 0x94);
+        put(0x2f80, firstPattern);
+        put(0x2fc0, secondPattern);
+        Function mutualFirst = function(0x2f80, 32, null);
+        Function mutualSecond = function(0x2fc0, 32, null);
+        disassemble(toAddr(0x2f80));
+        disassemble(toAddr(0x2fc0));
+        byte[] firstSite = concat(exportV11(0, "v11_mutual_soft_a", 0, 0x20), new byte[] {1},
+            siteV11(1, "v11_mutual_soft_b", 0, new byte[0]));
+        byte[] secondSite = concat(exportV11(0, "v11_mutual_soft_b", 0, 0x20), new byte[] {1},
+            siteV11(1, "v11_mutual_soft_a", 0, new byte[0]));
+        FlirtAnalysisSession session = analyze(new String[] {"mutual-a.sig", "mutual-b.sig"},
+            v11Signature(firstPattern, callMask(), 0, 0, 32, firstSite, 32),
+            v11Signature(secondPattern, callMask(), 0, 0, 32, secondSite, 32));
+        check("v11_mutual_soft_a".equals(mutualFirst.getName()) &&
+            "v11_mutual_soft_b".equals(mutualSecond.getName()),
+            "unique compatible ordinary-site candidates can reference each other");
+        check(session.getAppliedCount() == 2 && session.getConflicts().isEmpty(),
+            "mutual optional references do not create a false conflict or unresolved hard cycle");
+    }
+
+    private static byte[] v11Signature(byte[] pattern, long mask, int crcLength, int crc,
+            int moduleLength, byte[] exports, int patternLength) {
+        byte[] header = header(11, "Independent v11 matching");
+        header[41] = (byte) patternLength;
+        header[42] = (byte) (patternLength >>> 8);
+        return concat(header, new byte[] {1}, treeNode(pattern, mask, crcLength, crc,
+            moduleLength, exports));
+    }
+
+    private static byte[] instructionBits(long mask, long value) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        number(out, mask);
+        number(out, value);
+        return out.toByteArray();
+    }
+
+    private static byte[] siteV11(int offset, String name, int flags, byte[] metadata) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        number(out, offset);
+        byte[] encoded = name.getBytes(StandardCharsets.US_ASCII);
+        out.write(encoded.length >>> 8);
+        out.write(encoded.length);
+        out.writeBytes(encoded);
+        out.write(flags);
+        out.writeBytes(metadata);
+        return out.toByteArray();
+    }
+
+    private static byte[] exportV11(int delta, String name, int publicFlags, int parseFlags) {
+        return exportV11(delta, name, publicFlags, parseFlags, new byte[0]);
+    }
+
+    private static byte[] exportV11(int delta, String name, int publicFlags, int parseFlags,
+            byte[] metadata) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        number(out, delta);
+        byte[] encoded = name.getBytes(StandardCharsets.US_ASCII);
+        out.write(encoded.length >>> 8);
+        out.write(encoded.length);
+        out.write(publicFlags);
+        out.writeBytes(encoded);
+        out.writeBytes(metadata);
+        out.write(parseFlags);
+        return out.toByteArray();
+    }
+
+    private static byte[] zlib(byte[] bytes) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (var compressed = new java.util.zip.DeflaterOutputStream(out)) {
+            compressed.write(bytes);
+        }
+        return out.toByteArray();
+    }
+
     private void testGroupedSignatureProvenance() throws Exception {
         Path root = Files.createTempDirectory("siganalyzer-group-provenance-");
         try {
@@ -963,14 +1254,22 @@ public class SigAnalyzerSmokeTest extends GhidraScript {
     }
 
     private static byte[] header(String library) {
+        return header(10, library);
+    }
+
+    private static byte[] header(int version, String library) {
         byte[] name = library.getBytes(StandardCharsets.US_ASCII);
-        byte[] header = new byte[45 + name.length];
+        int fixedLength = version >= 11 ? 46 : 45;
+        byte[] header = new byte[fixedLength + name.length];
         System.arraycopy("IDASGN".getBytes(StandardCharsets.US_ASCII), 0, header, 0, 6);
-        header[6] = 10;
+        header[6] = (byte) version;
         header[34] = (byte) name.length;
         header[37] = 1;
         header[41] = 32;
-        System.arraycopy(name, 0, header, 45, name.length);
+        if (version >= 11) {
+            header[45] = (byte) 0xa5;
+        }
+        System.arraycopy(name, 0, header, fixedLength, name.length);
         return header;
     }
 

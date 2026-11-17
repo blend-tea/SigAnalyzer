@@ -18,6 +18,15 @@ A menu is added under **Tools** where you can add/remove signatures and choose w
 
 ## Usage
 
+### Supported signature formats
+
+SigAnalyzer reads FLIRT `.sig` versions **5–11**, including IDA 9.5's v11
+format, with uncompressed or zlib-compressed data. Version 11 uses a different
+header, length-prefixed names and additional instruction/reference metadata;
+changing a signature's version byte does not convert its format.
+Zstandard-compressed signatures are currently unsupported and are reported in
+the analysis log. Decompressed signatures and matching buffers are limited to 64 MiB.
+
 ### Adding FLIRT Signatures
 
 ![Open SigAnalyzer](./images/OpenSigAnalyzer.png)
@@ -39,8 +48,11 @@ You may need to run **Demangler Microsoft** or **Demangler Rust** as needed. Wit
 
 The analyzer applies names to existing functions and preserves program entry
 points and user-defined names. Choose signatures for the program's processor,
-platform and ABI. Referenced-function constraints must be resolved before a
-module can match. SigAnalyzer does not discover or create missing functions.
+platform and ABI. Mandatory referenced-function constraints must be resolved
+before a module can match. Version 11's ordinary relocation sites are optional
+evidence; tiny-module and import-name sites require a resolved target. SigAnalyzer
+does not discover or create missing functions, or reproduce IDA's full scoring
+and name-propagation behavior. See the [format review](docs/FLIRT_REVIEW.md) for limits.
 
 ## Function ID and ambiguous matches
 

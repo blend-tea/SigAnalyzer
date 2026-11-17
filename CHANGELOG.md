@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2 — 2026-11-17
+
+- Read FLIRT v11 signatures used by IDA 9.5, including the extra header byte,
+  length-prefixed public names, signed offsets and relocation/alternative-site tables.
+- Check v11 instruction masks, use the header pattern size for CRC placement,
+  and distinguish optional relocation evidence from mandatory reference constraints.
+  Preserve conflicts instead of selecting a candidate through disappearing optional evidence.
+- Correct v10+ variable-length trie nodes and support wildcard bitmaps longer than 64 bytes.
+- Report unsupported Zstandard compression explicitly. Uncompressed and zlib
+  v11 signatures are supported; existing v5–v10 behavior remains covered by regression tests.
+- Validate all 42 reported v11 files to end-of-stream against an independent reader.
+  Add synthetic parsing and headless matching regressions without distributing supplied signatures.
+
 ## 0.4.1 — 2026-11-17
 
 - Configure the native YARA executable with a file chooser in **Edit → Tool

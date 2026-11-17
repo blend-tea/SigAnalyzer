@@ -36,6 +36,9 @@ final class FlirtTestFixtures {
         if (version >= 10) {
             littleEndian(out, 0x1234, 2);
         }
+        if (version >= 11) {
+            out.write(0xa5); // independent, nonzero toolchain metadata
+        }
         bytes(out, name);
         return out.toByteArray();
     }
@@ -51,7 +54,12 @@ final class FlirtTestFixtures {
             long moduleLength, byte[] exportsAndExtras) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         number(out, 1); // root has one child
-        out.write(pattern.length);
+        if (version >= 10) {
+            offset(out, 8, pattern.length); // node lengths use var15, not var32
+        }
+        else {
+            out.write(pattern.length);
+        }
         if (pattern.length < 16) {
             offset(out, 8, mask);
         }
@@ -77,10 +85,55 @@ final class FlirtTestFixtures {
     }
 
     static byte[] export(int version, long delta, String name, int flags) {
+        if (version >= 11) {
+            return exportV11(delta, name, 0, flags, new byte[0]);
+        }
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         offset(out, version, delta);
         bytes(out, name.getBytes(StandardCharsets.UTF_8));
         out.write(flags);
+        return out.toByteArray();
+    }
+
+    static byte[] exportV11(long delta, String name, int publicFlags, int parseFlags,
+            byte[] metadata) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        number(out, delta);
+        byte[] encoded = name.getBytes(StandardCharsets.UTF_8);
+        out.write(encoded.length >>> 8);
+        out.write(encoded.length);
+        out.write(publicFlags);
+        bytes(out, encoded);
+        bytes(out, metadata);
+        out.write(parseFlags);
+        return out.toByteArray();
+    }
+
+    static byte[] longNodeV11(byte[] pattern, boolean[] wildcards, byte[] exports) {
+        if (pattern.length <= 64 || wildcards.length != pattern.length) {
+            throw new IllegalArgumentException("requires a long v11 node and one wildcard per byte");
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        number(out, 1);
+        offset(out, 8, pattern.length);
+        for (int firstBit = 0; firstBit < pattern.length; firstBit += 8) {
+            int bitmap = 0;
+            for (int bit = 0; bit < 8 && firstBit + bit < pattern.length; bit++) {
+                if (wildcards[pattern.length - firstBit - bit - 1]) {
+                    bitmap |= 1 << bit;
+                }
+            }
+            out.write(bitmap);
+        }
+        for (int i = 0; i < pattern.length; i++) {
+            if (!wildcards[i]) {
+                out.write(pattern[i]);
+            }
+        }
+        number(out, 0);
+        bytes(out, new byte[] {0, 0, 0}); // no CRC bytes, zero CRC
+        number(out, pattern.length);
+        bytes(out, exports);
         return out.toByteArray();
     }
 

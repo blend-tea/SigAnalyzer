@@ -15,7 +15,7 @@ public class FlirtHeaderParserTest {
 
     @Test
     public void readsLittleEndianMetadataInEverySupportedVersion() {
-        for (int version = 5; version <= 10; version++) {
+        for (int version = 5; version <= 11; version++) {
             long count = version == 5 ? 0xf234 : 0x81234567L;
             FlirtHeaderParser.HeaderInfo info = parse(
                 FlirtTestFixtures.header(version, 0x10, 0x0123, "Synthetic library", count));
@@ -32,27 +32,35 @@ public class FlirtHeaderParserTest {
             if (version >= 10) {
                 assertEquals(0x1234, info.getV10().unknown & 0xffff);
             }
+            if (version >= 11) {
+                assertEquals(0xa5, info.getV11().toolchain & 0xff);
+            }
+            else {
+                assertNull(info.getV11());
+            }
         }
     }
 
     @Test
     public void readsTheFullUnsignedLibraryNameLengthAndLeavesBodyUnread() throws Exception {
-        for (int size : new int[] {0, 127, 128, 255}) {
-            String name = "a".repeat(size);
-            byte[] header = FlirtTestFixtures.header(10, 0, 32, name, 1);
-            byte[] file = Arrays.copyOf(header, header.length + 1);
-            file[header.length] = 0x5a;
-            DataInputStream input = new DataInputStream(new ByteArrayInputStream(file));
-            FlirtHeaderParser.HeaderInfo info = FlirtHeaderParser.parseHeader(input);
-            assertNotNull("name length " + size, info);
-            assertEquals(name, info.getLibraryName());
-            assertEquals(0x5a, input.readUnsignedByte());
+        for (int version : new int[] {10, 11}) {
+            for (int size : new int[] {0, 127, 128, 255}) {
+                String name = "a".repeat(size);
+                byte[] header = FlirtTestFixtures.header(version, 0, 32, name, 1);
+                byte[] file = Arrays.copyOf(header, header.length + 1);
+                file[header.length] = 0x5a;
+                DataInputStream input = new DataInputStream(new ByteArrayInputStream(file));
+                FlirtHeaderParser.HeaderInfo info = FlirtHeaderParser.parseHeader(input);
+                assertNotNull("name length " + size, info);
+                assertEquals(name, info.getLibraryName());
+                assertEquals(0x5a, input.readUnsignedByte());
+            }
         }
     }
 
     @Test
     public void rejectsEveryTruncatedHeaderAndLibraryName() {
-        for (int version = 5; version <= 10; version++) {
+        for (int version = 5; version <= 11; version++) {
             byte[] full = FlirtTestFixtures.header(version, 0, 32, "Library", 1);
             for (int length = 0; length < full.length; length++) {
                 assertNull("version " + version + ", length " + length,
@@ -66,10 +74,28 @@ public class FlirtHeaderParserTest {
         byte[] file = FlirtTestFixtures.header(10, 0, 32, "Library", 1);
         file[0] = 'X';
         assertNull(parse(file));
-        for (int version : new int[] {0, 4, 11, 255}) {
+        for (int version : new int[] {0, 4, 12, 255}) {
             file = FlirtTestFixtures.header(10, 0, 32, "Library", 1);
             file[6] = (byte) version;
             assertNull("version " + version, parse(file));
         }
+    }
+
+    @Test
+    public void v11ToolchainBytePrecedesLibraryNameWithoutConsumingTreeData() throws Exception {
+        byte[] header = FlirtTestFixtures.header(11, 0x10, 0x0123, "Synthetic v11 library", 0x81234567L);
+        assertEquals(0xa5, header[45] & 0xff);
+        assertEquals('S', header[46]);
+        header[45] = (byte) 0xff;
+        byte[] file = FlirtTestFixtures.concat(header, new byte[] {0x5a});
+        DataInputStream input = new DataInputStream(new ByteArrayInputStream(file));
+        FlirtHeaderParser.HeaderInfo info = FlirtHeaderParser.parseHeader(input);
+        assertNotNull(info);
+        assertEquals(0xff, info.getV11().toolchain & 0xff);
+        assertEquals("Synthetic v11 library", info.getLibraryName());
+        assertEquals(0x81234567L, info.getFunctionCount());
+        assertEquals(0x0123, info.getV8V9().patternSize & 0xffff);
+        assertEquals(0x5a, input.readUnsignedByte());
+        assertNull(parse(Arrays.copyOf(FlirtTestFixtures.header(11, 0, 32, "", 1), 45)));
     }
 }

@@ -83,7 +83,7 @@ public class ApplyFlirtTest {
 
     @Test
     public void parsesCompressedAndUncompressedTreesInEverySupportedVersion() throws Exception {
-        for (int version = 5; version <= 10; version++) {
+        for (int version = 5; version <= 11; version++) {
             for (boolean compressed : new boolean[] {false, true}) {
                 Object root = parse(FlirtTestFixtures.signature(version, 32,
                     oneExportTree(version), compressed));
@@ -96,7 +96,7 @@ public class ApplyFlirtTest {
 
     @Test(timeout = 3000)
     public void rejectsTruncatedAndInvalidCompressedBodiesWithoutHanging() throws Exception {
-        for (int version : new int[] {5, 6, 7, 10}) {
+        for (int version : new int[] {5, 6, 7, 10, 11}) {
             byte[] file = FlirtTestFixtures.signature(version, 32, oneExportTree(version), true);
             assertNull("version " + version + " missing compressed trailer",
                 parse(Arrays.copyOf(file, file.length - 1)));
@@ -109,7 +109,7 @@ public class ApplyFlirtTest {
 
     @Test
     public void rejectsEveryTruncatedUncompressedTree() throws Exception {
-        for (int version : new int[] {5, 8, 9, 10}) {
+        for (int version : new int[] {5, 8, 9, 10, 11}) {
             byte[] body = oneExportTree(version);
             for (int length = 0; length < body.length; length++) {
                 assertNull("version " + version + ", body length " + length,
@@ -117,6 +117,143 @@ public class ApplyFlirtTest {
                         Arrays.copyOf(body, length), false)));
             }
         }
+    }
+
+    @Test
+    public void rejectsUnsupportedFutureVersionTwelve() throws Exception {
+        byte[] file = FlirtTestFixtures.signature(11, 32, oneExportTree(11), false);
+        file[6] = 12;
+        assertNull(parse(file));
+    }
+
+    @Test
+    public void v11LongNodesUseVar15LengthsAndLittleEndianWildcardBitmaps() throws Exception {
+        byte[] pattern = new byte[130];
+        for (int i = 0; i < pattern.length; i++) {
+            pattern[i] = (byte) (i + 1);
+        }
+        boolean[] wildcards = new boolean[pattern.length];
+        wildcards[0] = true;
+        wildcards[64] = true;
+        wildcards[129] = true;
+        byte[] body = FlirtTestFixtures.longNodeV11(pattern, wildcards,
+            FlirtTestFixtures.export(11, 0, "long_v11_pattern", 0));
+        Object root = parse(FlirtTestFixtures.signature(11, pattern.length, body, false));
+        assertNotNull(root);
+        Object node = first(root, "childList");
+        assertEquals(130, ((Number) get(node, "length")).intValue());
+        assertArrayEquals(wildcards, (boolean[]) get(node, "variantBoolArray"));
+        byte[] parsed = (byte[]) get(node, "patternBytes");
+        for (int i = 0; i < pattern.length; i++) {
+            if (!wildcards[i]) {
+                assertEquals("literal index " + i, pattern[i], parsed[i]);
+            }
+        }
+    }
+
+    @Test
+    public void v11PublicMetadataDoesNotMisalignTheFollowingModule() throws Exception {
+        ByteArrayOutputStream metadata = new ByteArrayOutputStream();
+        FlirtTestFixtures.number(metadata, 0xffffffffL); // instruction mask
+        FlirtTestFixtures.number(metadata, 0x12345678L); // instruction value
+        FlirtTestFixtures.number(metadata, 0x87654321L); // 0x40 extension
+        FlirtTestFixtures.bytes(metadata, new byte[] {(byte) 0xab, (byte) 0xcd, (byte) 0xff});
+        byte[] exports = FlirtTestFixtures.concat(
+            FlirtTestFixtures.exportV11(0, "metadata_public", 0xc0, 8, metadata.toByteArray()),
+            new byte[] {64}, FlirtTestFixtures.export(11, 0, "following_public", 0));
+        Object root = parse(FlirtTestFixtures.signature(11, 32,
+            FlirtTestFixtures.tree(11, new byte[32], 0, 0, 0, 64, exports), false));
+        assertNotNull(root);
+        List<?> modules = (List<?>) get(first(root, "childList"), "moduleList");
+        assertEquals(2, modules.size());
+        assertEquals("metadata_public", get(first(modules.get(0), "publicFunctions"), "name"));
+        assertEquals("following_public", get(first(modules.get(1), "publicFunctions"), "name"));
+    }
+
+    @Test
+    public void v11PublicFlagCanSubtractTheNextOffsetDelta() throws Exception {
+        byte[] exports = FlirtTestFixtures.concat(
+            FlirtTestFixtures.exportV11(32, "later_export", 0, 1, new byte[0]),
+            FlirtTestFixtures.exportV11(8, "earlier_export", 0x10, 0, new byte[0]));
+        Object root = parse(FlirtTestFixtures.signature(11, 32,
+            FlirtTestFixtures.tree(11, new byte[32], 0, 0, 0, 64, exports), false));
+        assertNotNull(root);
+        Object module = first(first(root, "childList"), "moduleList");
+        List<?> publics = (List<?>) get(module, "publicFunctions");
+        assertEquals(32L, ((Number) get(publics.get(0), "offset")).longValue());
+        assertEquals(24L, ((Number) get(publics.get(1), "offset")).longValue());
+    }
+
+    @Test
+    public void v11TailCountIsUnsignedAndLegacyReferenceHasItsOwnLengthEncoding() throws Exception {
+        ByteArrayOutputStream extras = new ByteArrayOutputStream();
+        FlirtTestFixtures.bytes(extras, FlirtTestFixtures.export(11, 0, "v11_constraints", 6));
+        extras.write(128); // v11 stores the tail count as one unsigned byte
+        for (int i = 0; i < 128; i++) {
+            FlirtTestFixtures.number(extras, i);
+            extras.write(i);
+        }
+        extras.write(127); // v11 ignores this legacy reference-count byte and reads one reference
+        FlirtTestFixtures.number(extras, 3);
+        extras.write(0);
+        FlirtTestFixtures.offset(extras, 8, 300); // extended name length is var15
+        FlirtTestFixtures.bytes(extras, "r".repeat(299).getBytes(StandardCharsets.US_ASCII));
+        extras.write(0); // trailing NUL means negative reference offset
+        Object root = parse(FlirtTestFixtures.signature(11, 32,
+            FlirtTestFixtures.tree(11, new byte[32], 0, 0, 0, 256, extras.toByteArray()), false));
+        assertNotNull(root);
+        Object module = first(first(root, "childList"), "moduleList");
+        assertEquals(128, ((List<?>) get(module, "tailBytes")).size());
+        assertEquals(1, ((List<?>) get(module, "referencedFunctions")).size());
+        Object reference = first(module, "referencedFunctions");
+        assertEquals("r".repeat(299), get(reference, "name"));
+        assertEquals(3L, ((Number) get(reference, "offset")).longValue());
+        assertEquals(true, get(reference, "negativeOffset"));
+    }
+
+    @Test
+    public void v11SiteAndAlternativeMetadataAreReadWithoutMisaligningTheTree() throws Exception {
+        ByteArrayOutputStream extras = new ByteArrayOutputStream();
+        FlirtTestFixtures.bytes(extras, FlirtTestFixtures.export(11, 0, "v11_sites", 0x60));
+        FlirtTestFixtures.number(extras, 1);
+        v11Site(extras, 4, "synthetic_site", 0x88);
+        FlirtTestFixtures.number(extras, 0x00ff00ff);
+        FlirtTestFixtures.number(extras, 0x00110022);
+        FlirtTestFixtures.number(extras, 33);
+        FlirtTestFixtures.number(extras, 1); // alternative list count
+        FlirtTestFixtures.number(extras, 1); // one site in that alternative
+        v11Site(extras, 8, "alternative_site", 0x40);
+        FlirtTestFixtures.number(extras, 9);
+        FlirtTestFixtures.bytes(extras, new byte[] {(byte) 0xab, (byte) 0xcd, 0x12});
+        Object root = parse(FlirtTestFixtures.signature(11, 32,
+            FlirtTestFixtures.tree(11, new byte[32], 0, 0, 0, 32, extras.toByteArray()), false));
+        assertNotNull(root);
+        Object module = first(first(root, "childList"), "moduleList");
+        assertEquals(1, ((List<?>) get(module, "sites")).size());
+        Object site = first(module, "sites");
+        assertEquals("synthetic_site", get(site, "name"));
+        assertEquals(4L, ((Number) get(site, "offset")).longValue());
+        assertEquals(33L, ((Number) get(site, "extra08")).longValue());
+        Object bits = get(site, "instructionBits");
+        assertEquals(0x00ff00ffL, ((Number) get(bits, "mask")).longValue());
+        assertEquals(0x00110022L, ((Number) get(bits, "value")).longValue());
+        List<?> alternatives = (List<?>) get(module, "alternativeSites");
+        assertEquals(1, alternatives.size());
+        Object alternative = ((List<?>) alternatives.get(0)).get(0);
+        assertEquals("alternative_site", get(alternative, "name"));
+        Object extension = get(alternative, "extra40");
+        assertEquals(9L, ((Number) get(extension, "a")).longValue());
+        assertEquals(0xabcd, ((Number) get(extension, "b")).intValue());
+        assertEquals(0x12, ((Number) get(extension, "c")).intValue());
+    }
+
+    private static void v11Site(ByteArrayOutputStream output, int offset, String name, int flags) {
+        FlirtTestFixtures.number(output, offset);
+        byte[] bytes = name.getBytes(StandardCharsets.US_ASCII);
+        output.write(bytes.length >>> 8);
+        output.write(bytes.length);
+        FlirtTestFixtures.bytes(output, bytes);
+        output.write(flags);
     }
 
     @Test
@@ -203,12 +340,16 @@ public class ApplyFlirtTest {
 
     private Object module(int crcLength, int crc, long length) throws Exception {
         Object module = create("FlirtModule");
+        set(module, "version", 10);
+        set(module, "patternSize", 32);
         set(module, "crcLength", crcLength);
         set(module, "crc16", crc);
         set(module, "length", length);
         set(module, "publicFunctions", Collections.emptyList());
         set(module, "tailBytes", Collections.emptyList());
         set(module, "referencedFunctions", Collections.emptyList());
+        set(module, "sites", Collections.emptyList());
+        set(module, "alternativeSites", Collections.emptyList());
         return module;
     }
 
