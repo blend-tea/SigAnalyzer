@@ -43,8 +43,14 @@
     one YARA rule must match the original imported binary before the signatures directly
     in that folder are analyzed. Child folders do not inherit rules. Remove the rule
     to analyze that group without a YARA condition.</P>
-    <P>Install native YARA 4 or configure its full executable path in the SigAnalyzer
-    analysis options. The scan timeout defaults to 30 seconds per group. Rule errors,
+    <H2><a name="YaraExecutable"></a>YARA Executable</H2>
+    <P>Install native YARA 4 and select its executable using
+    <B>Edit &gt; Tool Options &gt; SigAnalyzer &gt; YARA Executable</B>.
+    Use <B>File &gt; Save Tool</B> to retain this tool-specific setting. The selected
+    path applies on the next analysis run. An unset path retains the existing
+    per-program YARA Executable analysis setting, whose default searches PATH for yara.
+    Headless analysis uses the per-program setting.</P>
+    <P>The scan timeout remains in the analysis options and defaults to 30 seconds per group. Rule errors,
     missing YARA or missing original bytes skip only the affected group and are reported
     in the analysis log. Groups without rules do not require YARA.</P>
   </BODY>

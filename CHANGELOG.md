@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 — 2026-11-17
+
+- Configure the native YARA executable with a file chooser in **Edit → Tool
+  Options → SigAnalyzer → YARA Executable**. Save the tool to persist the path.
+- Use the current analysis tool's configured path on each run, while retaining
+  legacy per-program analysis settings and PATH lookup for unset/headless cases.
+- Update the English/Japanese documentation with the Tool Options location and screenshot.
+
 ## 0.4.0 — 2026-11-16
 
 - Apply a selected FLIRT conflict candidate using the right-click menu. The

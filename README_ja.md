@@ -106,9 +106,21 @@ rule openssl_binary {
 
 YARA 条件を使うグループには、ネイティブの **YARA 4** 実行ファイルが必要です。
 Debian/Ubuntu では `apt install yara`、macOS では `brew install yara` などで導入します。
-Windows などで実行ファイルを直接指定する場合は、解析オプションの
-**SigAnalyzer → YARA Executable** にフルパスを設定してください。コマンド引数は含めません。
+Windows などで実行ファイルを直接指定する場合は、CodeBrowser の
+**Edit → Tool Options → SigAnalyzer → YARA Executable**
+から、ファイル選択で実行ファイルを指定して設定を適用します。
+Windows ではダウンロードした YARA の `.exe` を選択してください。コマンド引数は含めません。
+**File → Save Tool** でツールの設定として保存できます。変更は次回の SigAnalyzer 実行から反映され、再起動は不要です。
+SigAnalyzer の項目がない場合は、CodeBrowser のプラグイン設定で **SigAnalyzerPlugin** を有効にしてください。
+
+![Tool Options で YARA 実行ファイルを設定](./images/YaraToolOptions.png)
+
+このツールで解析するプログラムには、Tool Options のパスを優先して使用します。
+未設定の場合は従来の解析オプション **YARA Executable** にフォールバックします。
+その初期値は `yara` で、PATH から検索します。
+GUI ツールのない headless 解析では、従来の解析オプションを使用します。
 **YARA Timeout Seconds** の初期値はグループごとに 30 秒です。
+タイムアウトは引き続き解析オプションで設定します。
 ルールがないグループでは YARA の導入は不要です。
 
 照合には Ghidra が保持する元の `FileBytes` を使用するため、元ファイルがディスク上になくても動作します。

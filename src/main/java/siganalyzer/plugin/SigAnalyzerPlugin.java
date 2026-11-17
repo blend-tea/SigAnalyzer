@@ -33,6 +33,7 @@ import ghidra.util.Swing;
 import ghidra.util.SystemUtilities;
 import siganalyzer.analyzer.FlirtAnalysisResults;
 import siganalyzer.analyzer.FlirtCandidate;
+import siganalyzer.analyzer.YaraConfiguration;
 
 /**
  * Provide class-level documentation that describes what this plugin does.
@@ -61,6 +62,7 @@ public class SigAnalyzerPlugin extends ProgramPlugin {
 	 */
 	public SigAnalyzerPlugin(PluginTool tool) {
 		super(tool);
+		YaraConfiguration.registerToolOptions(tool.getOptions(YaraConfiguration.TOOL_OPTIONS));
 
 		// Customize provider (or remove if a provider is not desired)
 		String pluginName = getName();

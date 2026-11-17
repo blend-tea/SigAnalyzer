@@ -14,6 +14,7 @@ import java.util.stream.Collectors;
 
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.importer.MessageLog;
+import ghidra.framework.options.ToolOptions;
 import ghidra.program.database.ProgramDB;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
@@ -26,6 +27,7 @@ import siganalyzer.analyzer.FlirtAnalysisResults;
 import siganalyzer.analyzer.FlirtCandidate;
 import siganalyzer.analyzer.FlirtConflictResolution;
 import siganalyzer.analyzer.YaraSignatureGate;
+import siganalyzer.analyzer.YaraConfiguration;
 import siganalyzer.analyzer.SignatureRepository;
 import siganalyzer.analyzer.SignatureSelection;
 import ghidra.util.exception.CancelledException;
@@ -61,6 +63,7 @@ public class SigAnalyzerSmokeTest extends GhidraScript {
         testGroupedSignatureSelection();
         testGroupedSignatureProvenance();
         testClosingProgramClearsOverlayReport();
+        testYaraToolOptionsExecutableSelection();
         println("SIGANALYZER_SMOKE_TEST_PASSED");
     }
 
@@ -787,6 +790,52 @@ public class SigAnalyzerSmokeTest extends GhidraScript {
         finally {
             removeTemporaryDirectory(root);
         }
+    }
+
+    private void testYaraToolOptionsExecutableSelection() throws Exception {
+        Path root = Files.createTempDirectory("siganalyzer-tool-yara-");
+        ToolOptions options = new ToolOptions(YaraConfiguration.TOOL_OPTIONS);
+        try {
+            SignatureRepository repository = new SignatureRepository(root);
+            Path group = repository.createGroup("gated").directory();
+            Path signature = Files.write(group.resolve("gated.sig"), new byte[] {1});
+            Files.writeString(group.resolve(SignatureRepository.RULE_FILE),
+                "rule original_fixture { condition: filesize == 1 and uint8(0) == 0xc3 }");
+            Path executables = Files.createDirectories(root.resolve("non default YARA paths"));
+            Path firstMarker = root.resolve("first-executable-called");
+            Path first = Files.writeString(executables.resolve("first yara executable"),
+                "#!/bin/sh\nprintf 'called\\n' >> " + shellQuote(firstMarker.toString()) +
+                    "\nexec " + shellQuote(nativeYara()) + " \"$@\"\n");
+            check(first.toFile().setExecutable(true), "first configured YARA executable created");
+            YaraConfiguration.registerToolOptions(options);
+            options.setFile(YaraConfiguration.EXECUTABLE_OPTION, first.toFile());
+            SignatureSelection.Result selected = SignatureSelection.select(repository, currentProgram,
+                YaraConfiguration.executable(options, "missing-yara-fallback"), 10, monitor, new MessageLog());
+            check(selected.success() && selected.signatures().equals(List.of(signature.toFile())),
+                "tool-configured executable path runs the real native YARA gate");
+            check(Files.exists(firstMarker), "native YARA was launched through the selected custom path");
+
+            Path secondMarker = root.resolve("changed-executable-called");
+            Path second = Files.writeString(executables.resolve("changed yara executable"),
+                "#!/bin/sh\nprintf 'called\\n' >> " + shellQuote(secondMarker.toString()) +
+                    "\nexec " + shellQuote(nativeYara()) + " \"$@\"\n");
+            check(second.toFile().setExecutable(true), "changed configured YARA executable created");
+            options.setFile(YaraConfiguration.EXECUTABLE_OPTION, second.toFile());
+            selected = SignatureSelection.select(repository, currentProgram,
+                YaraConfiguration.executable(options, "missing-yara-fallback"), 10, monitor, new MessageLog());
+            check(selected.success() && selected.signatures().equals(List.of(signature.toFile())),
+                "changed tool setting is honored on the next YARA selection");
+            check(Files.exists(secondMarker), "the changed executable path is launched");
+            check(Files.readAllLines(firstMarker).size() == 1, "the previous executable is not cached after a settings change");
+        }
+        finally {
+            options.dispose();
+            removeTemporaryDirectory(root);
+        }
+    }
+
+    private static String shellQuote(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
     }
 
     private void testGroupedSignatureProvenance() throws Exception {

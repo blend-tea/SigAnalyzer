@@ -67,7 +67,8 @@ public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
     @Override
     public void registerOptions(Options options, Program program) {
         options.registerOption(YARA_EXECUTABLE_OPTION, "yara", null,
-            "Native YARA 4 executable name or full path. Required only for groups with rules.yar.");
+            "Legacy/headless YARA executable name or path. In the GUI, prefer Edit > Tool Options > " +
+                "SigAnalyzer > YARA Executable. This value is used when the tool path is unset.");
         options.registerOption(YARA_TIMEOUT_OPTION, 30, null,
             "Maximum time in seconds for each signature group's YARA scan.");
     }
@@ -86,8 +87,9 @@ public class SigAnalyzerAnalyzer extends AbstractAnalyzer {
             .resolve("signatures").resolve(processorName);
         try {
             SignatureRepository repository = new SignatureRepository(directory);
+            String executable = YaraConfiguration.executable(program, yaraExecutable);
             SignatureSelection.Result selection = SignatureSelection.select(repository, program,
-                yaraExecutable, yaraTimeoutSeconds, monitor, log);
+                executable, yaraTimeoutSeconds, monitor, log);
             FlirtAnalysisSession session = new FlirtAnalysisSession(program);
             boolean success = session.run(selection.signatures(), repository.root(), monitor, log);
             monitor.checkCancelled();

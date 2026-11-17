@@ -113,10 +113,23 @@ rule openssl_binary {
 
 YARA gating requires a native **YARA 4** executable. Install `yara` (for example,
 `apt install yara` on Debian/Ubuntu or `brew install yara` on macOS), or configure
-the executable's full path in **SigAnalyzer → YARA Executable** in the analysis
-options. On Windows, use the path to the downloaded YARA executable. Enter a
-single executable path without command-line arguments. **YARA Timeout Seconds**
-defaults to 30 per group. Groups without rules do not require YARA.
+the executable in the CodeBrowser's **Edit → Tool Options → SigAnalyzer → YARA
+Executable**. Use the file chooser to select the native executable, then apply
+the options. On Windows, select the downloaded YARA `.exe`. Enter a single
+executable path without command-line arguments. Save the tool with **File → Save
+Tool** to retain the setting in its configuration. Changes take effect on the
+next SigAnalyzer run; no restart is required.
+If the SigAnalyzer category is missing, enable **SigAnalyzerPlugin** in the
+CodeBrowser's plugin configuration.
+
+![Configuring the native YARA executable in Tool Options](./images/YaraToolOptions.png)
+
+The configured tool path takes priority for programs analyzed in that tool.
+If it is unset, SigAnalyzer retains the program's previous **YARA Executable**
+analysis setting; its default is `yara`, resolved through PATH. Headless analysis
+uses that existing analysis setting because no GUI tool is available.
+**YARA Timeout Seconds** remains in the analysis options and defaults to 30 per
+group. Groups without rules do not require YARA.
 
 The gate uses original `FileBytes`, even when the original file is no longer
 on disk; patched program memory is not the scan target. If several imports are
